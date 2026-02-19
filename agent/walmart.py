@@ -25,11 +25,75 @@ SESSION_PATH: str = os.getenv("SESSION_PATH", "sessions/walmart_session.json")
 HEADLESS: bool = os.getenv("HEADLESS", "true").lower() == "true"
 WALMART_BASE = "https://www.walmart.ca"
 
+# Use a real, recent Chrome UA — no "HeadlessChrome" in the string
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
+
+# Launch flags that strip Playwright's automation signals
+_STEALTH_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-blink-features=AutomationControlled",  # removes navigator.webdriver
+    "--disable-infobars",
+    "--disable-dev-shm-usage",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--disable-extensions",
+]
+
+# JS injected before every page load to mask remaining automation fingerprints
+_STEALTH_SCRIPT = """
+// Remove the main automation flag
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+// Mock a real Chrome runtime
+window.chrome = {
+    runtime: {},
+    loadTimes: function() {},
+    csi: function() {},
+    app: {}
+};
+
+// Realistic plugin list
+Object.defineProperty(navigator, 'plugins', {
+    get: () => {
+        const arr = [
+            { name: 'Chrome PDF Plugin',   filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chrome PDF Viewer',   filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+            { name: 'Native Client',       filename: 'internal-nacl-plugin', description: '' },
+        ];
+        arr.item   = i => arr[i];
+        arr.namedItem = n => arr.find(p => p.name === n) || null;
+        arr.refresh = () => {};
+        return arr;
+    }
+});
+
+// Languages consistent with locale
+Object.defineProperty(navigator, 'languages', { get: () => ['en-CA', 'en-US', 'en'] });
+
+// Platform
+Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' });
+
+// Permissions — prevent detection via permission probe
+const _origPermQuery = window.navigator.permissions.query.bind(navigator.permissions);
+window.navigator.permissions.query = params =>
+    params.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : _origPermQuery(params);
+
+// WebGL — mask Mesa/SwiftShader (headless tell-tale)
+const _getParam = WebGLRenderingContext.prototype.getParameter;
+WebGLRenderingContext.prototype.getParameter = function(p) {
+    if (p === 37445) return 'Intel Inc.';
+    if (p === 37446) return 'Intel Iris OpenGL Engine';
+    return _getParam.call(this, p);
+};
+"""
 
 # Selectors for "Add to cart" — tried in order
 _ADD_TO_CART = [
@@ -139,12 +203,14 @@ class WalmartAgent:
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
             headless=self.headless,
-            args=["--no-sandbox", "--disable-setuid-sandbox"],
+            args=_STEALTH_ARGS,
         )
         ctx_kwargs: dict = {
             "viewport": {"width": 1280, "height": 900},
             "user_agent": _USER_AGENT,
             "locale": "en-CA",
+            "timezone_id": "America/Toronto",
+            "extra_http_headers": {"Accept-Language": "en-CA,en;q=0.9"},
         }
         session = Path(SESSION_PATH)
         if session.exists():
@@ -152,6 +218,7 @@ class WalmartAgent:
             logger.info("Loaded Walmart session from %s", SESSION_PATH)
 
         self._context = await self._browser.new_context(**ctx_kwargs)
+        await self._context.add_init_script(_STEALTH_SCRIPT)
         self.page = await self._context.new_page()
         return self
 
@@ -382,20 +449,31 @@ class WalmartLinker:
     async def start(self) -> None:
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
-            headless=False,          # must be visible — user interacts with it
-            args=["--no-sandbox"],
+            headless=False,   # must be visible — user interacts with it
+            args=_STEALTH_ARGS,
         )
         self._context = await self._browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=_USER_AGENT,
             locale="en-CA",
+            timezone_id="America/Toronto",
+            extra_http_headers={"Accept-Language": "en-CA,en;q=0.9"},
         )
+        # Inject stealth script before every page load
+        await self._context.add_init_script(_STEALTH_SCRIPT)
         self.page = await self._context.new_page()
+
+        # Go to homepage first (less suspicious than jumping straight to /signin)
+        await self.page.goto(WALMART_BASE, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+
+        # Now navigate to sign-in
         await self.page.goto(
             f"{WALMART_BASE}/en/signin",
             wait_until="domcontentloaded",
             timeout=30000,
         )
+        await asyncio.sleep(1)
 
     async def is_logged_in(self) -> bool:
         """Return True if the browser's current page looks like an authenticated session."""
