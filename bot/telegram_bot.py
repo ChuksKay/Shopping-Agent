@@ -74,7 +74,7 @@ _HELP = """
 
 /link - link your Walmart account (opens visible browser)
 /link confirm - overwrite existing session
-/link_done - save session after logging in
+`/link_done` - save session after logging in
 
 /help - show this message
 """.strip()
