@@ -1,6 +1,5 @@
 import os
 import aiosqlite
-from pathlib import Path
 
 DB_PATH = os.getenv("DB_PATH", "shopping_agent.db")
 
@@ -14,12 +13,15 @@ CREATE TABLE IF NOT EXISTS chats (
 )
 """
 
+# max_price / brand added in v2; ALTER TABLE migration handles existing DBs
 _CREATE_ITEMS = """
 CREATE TABLE IF NOT EXISTS items (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    text    TEXT    NOT NULL,
-    qty     INTEGER NOT NULL DEFAULT 1,
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id   INTEGER NOT NULL,
+    text      TEXT    NOT NULL,
+    qty       INTEGER NOT NULL DEFAULT 1,
+    max_price REAL    DEFAULT NULL,
+    brand     TEXT    DEFAULT NULL,
     FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
 )
 """
@@ -43,6 +45,14 @@ async def init_db() -> None:
         await db.execute(_CREATE_CHATS)
         await db.execute(_CREATE_ITEMS)
         await db.execute(_CREATE_JOBS)
+
+        # Migrate existing items table — add columns if missing
+        for col, typedef in [("max_price", "REAL"), ("brand", "TEXT")]:
+            try:
+                await db.execute(f"ALTER TABLE items ADD COLUMN {col} {typedef}")
+            except Exception:
+                pass  # column already exists
+
         await db.commit()
 
 
@@ -90,11 +100,26 @@ async def get_items(chat_id: int) -> list[dict]:
             return [dict(r) for r in await cur.fetchall()]
 
 
-async def add_items(chat_id: int, items: list[tuple[str, int]]) -> None:
+async def add_items(chat_id: int, items: list[dict]) -> None:
+    """
+    items: list of dicts with keys: name, qty, max_price (opt), brand (opt)
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executemany(
-            "INSERT INTO items (chat_id, text, qty) VALUES (?, ?, ?)",
-            [(chat_id, text, qty) for text, qty in items],
+            """
+            INSERT INTO items (chat_id, text, qty, max_price, brand)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    chat_id,
+                    item["name"],
+                    item["qty"],
+                    item.get("max_price"),
+                    item.get("brand"),
+                )
+                for item in items
+            ],
         )
         await db.commit()
 

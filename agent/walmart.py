@@ -332,10 +332,30 @@ class WalmartAgent:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    async def search_and_add(self, item: str, qty: int) -> bool:
-        """Search for *item* on walmart.ca and add it to cart. Returns True on success."""
+    async def search_and_add(
+        self,
+        name: str,
+        qty: int,
+        brand: str | None = None,
+        max_price: float | None = None,
+    ) -> bool:
+        """
+        Search for an item on walmart.ca and add it to cart.
+
+        If *brand* is provided it is prepended to the search query so Walmart
+        surfaces brand-specific results first (e.g. "indomie chicken noodles").
+
+        *max_price* is stored for future filtering; not yet applied at
+        search-result level (Walmart.ca price filters are JS-heavy).
+
+        Returns True on success.
+        """
+        # Build search query: brand prefix gives better brand-specific results
+        query = f"{brand} {name}".strip() if brand else name
+        label = f"{brand} {name}".strip() if brand else name  # for logging
+
         try:
-            encoded = item.replace(" ", "+")
+            encoded = query.replace(" ", "+")
             await self.page.goto(
                 f"{WALMART_BASE}/en/search?q={encoded}",
                 wait_until="domcontentloaded",
@@ -346,7 +366,7 @@ class WalmartAgent:
 
             # Try adding directly from search results
             if await self._try_add_from_page():
-                logger.info("Added '%s' from search results", item)
+                logger.info("Added '%s' from search results", label)
                 if qty > 1:
                     await self._update_cart_qty(qty)
                 return True
@@ -374,24 +394,28 @@ class WalmartAgent:
                         await asyncio.sleep(1.5)
                         await self._check()
                         if await self._try_add_from_page():
-                            logger.info("Added '%s' from product page", item)
+                            logger.info("Added '%s' from product page", label)
                             if qty > 1:
                                 await self._update_cart_qty(qty)
                             return True
                     break
 
-            logger.warning("Could not add '%s' to cart", item)
+            logger.warning("Could not add '%s' to cart", label)
             return False
 
         except BotChallengeError:
             raise
         except Exception as exc:
-            logger.error("Error processing item '%s': %s", item, exc, exc_info=True)
+            logger.error("Error processing '%s': %s", label, exc, exc_info=True)
             return False
 
-    async def build_cart(self, items: list[tuple[str, int]]) -> str:
+    async def build_cart(self, items: list[dict]) -> str:
         """
         Full flow: load walmart.ca, set postal code, add all items, return cart URL.
+
+        Each item dict must have: name, qty
+        Optional keys:           brand, max_price
+
         Raises BotChallengeError if Walmart presents a bot challenge.
         """
         logger.info("Building cart for %d item(s)", len(items))
@@ -401,16 +425,20 @@ class WalmartAgent:
         await self._set_postal_code()
 
         ok = 0
-        for text, qty in items:
+        for item in items:
             try:
-                if await self.search_and_add(text, qty):
+                if await self.search_and_add(
+                    name=item["name"],
+                    qty=item.get("qty", 1),
+                    brand=item.get("brand"),
+                    max_price=item.get("max_price"),
+                ):
                     ok += 1
             except BotChallengeError:
                 raise
 
         logger.info("Added %d/%d items", ok, len(items))
 
-        # Navigate to cart and return its URL
         await self.page.goto(
             f"{WALMART_BASE}/en/cart",
             wait_until="domcontentloaded",

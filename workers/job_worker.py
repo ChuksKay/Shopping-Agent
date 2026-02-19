@@ -1,8 +1,8 @@
 """
 Background job worker.
 
-- worker_loop()      polls SQLite for 'pending' jobs every 3 s and runs them.
-- process_job()      runs a single job (Walmart cart build) and fires a callback.
+- worker_loop()       polls SQLite for 'pending' jobs every 3 s and runs them.
+- process_job()       runs a single job (Walmart cart build) and fires a callback.
 - register_callback() lets the bot register a coroutine to call on completion.
 """
 
@@ -33,13 +33,22 @@ async def process_job(job: dict) -> None:
         chat = await get_chat(chat_id)
         postal_code = chat["postal_code"] if chat else ""
 
-        items_rows = await get_items(chat_id)
-        items = [(r["text"], r["qty"]) for r in items_rows]
-
-        if not items:
+        item_rows = await get_items(chat_id)
+        if not item_rows:
             await update_job(job_id, "failed", error="No items in list")
             await _fire(job_id, chat_id, None, "failed", "No items in list")
             return
+
+        # Build item dicts for the agent — include brand for smarter search
+        items = [
+            {
+                "name":      row["text"],
+                "qty":       row["qty"],
+                "max_price": row.get("max_price"),
+                "brand":     row.get("brand"),
+            }
+            for row in item_rows
+        ]
 
         async with WalmartAgent(postal_code=postal_code) as agent:
             cart_url = await agent.build_cart(items)
@@ -75,7 +84,6 @@ async def _fire(
             logger.error("Callback error for job %s: %s", job_id, exc)
 
 
-# Running jobs tracked here so worker_loop doesn't double-submit them
 _running: set[str] = set()
 
 

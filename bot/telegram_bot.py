@@ -55,11 +55,16 @@ _HELP = """
 *Caleb Shopping Agent* 🛒
 
 *Commands*
-/set `<postal>` `[delivery|pickup]` - set postal code & fulfilment mode
+/set `<postal>` `[delivery|pickup]` - set postal code & mode
   _e.g. /set M5V3A1 delivery_
 
-/add `<items>` - add items (comma or newline separated, qty prefix ok)
-  _e.g. /add milk, 2x eggs, bread_
+/add `<items>` - add items (comma or newline separated)
+  Supports qty, brand, max price:
+  _2x bread_
+  _indomie chicken x2_
+  _milk 2% 4L (max $8)_
+  _eggs 12 pack_
+  _noodles brand:indomie x3_
 
 /list - show current list
 /clear - clear current list
@@ -122,7 +127,12 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if len(parts) < 2:
         await update.message.reply_text(
-            "Usage: /add <items>\nExample: /add milk, 2x eggs, bread"
+            "Usage: /add <items>\n"
+            "Examples:\n"
+            "  /add milk, 2x eggs, bread\n"
+            "  /add indomie chicken x2\n"
+            "  /add milk 2% 4L (max $8)\n"
+            "  /add noodles brand:indomie x3"
         )
         return
 
@@ -139,8 +149,22 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     await add_items(chat_id, items)
 
-    lines = "\n".join(f"• {qty}x {name}" for name, qty in items)
-    await update.message.reply_text(f"Added:\n{lines}")
+    lines = []
+    for item in items:
+        line = f"• {item['qty']}x {item['name']}"
+        extras = []
+        if item.get("brand"):
+            extras.append(f"brand: {item['brand']}")
+        if item.get("max_price") is not None:
+            extras.append(f"max ${item['max_price']:.2f}")
+        if extras:
+            line += f"  _({', '.join(extras)})_"
+        lines.append(line)
+
+    await update.message.reply_text(
+        "Added:\n" + "\n".join(lines),
+        parse_mode="Markdown",
+    )
 
 
 # ── /list ──────────────────────────────────────────────────────────────────────
@@ -153,14 +177,24 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Your list is empty. Use /add to add items.")
         return
 
-    lines = "\n".join(f"• {r['qty']}x {r['text']}" for r in rows)
+    lines = []
+    for r in rows:
+        line = f"• {r['qty']}x {r['text']}"
+        extras = []
+        if r.get("brand"):
+            extras.append(f"brand: {r['brand']}")
+        if r.get("max_price") is not None:
+            extras.append(f"max ${r['max_price']:.2f}")
+        if extras:
+            line += f"  _({', '.join(extras)})_"
+        lines.append(line)
+
     chat = await get_chat(chat_id)
     postal = chat["postal_code"] if chat else "not set"
     mode = chat["mode"] if chat else "delivery"
 
     await update.message.reply_text(
-        f"*Shopping List*\n{lines}\n\n"
-        f"Postal: `{postal}` | Mode: `{mode}`",
+        f"*Shopping List*\n" + "\n".join(lines) + f"\n\nPostal: `{postal}` | Mode: `{mode}`",
         parse_mode="Markdown",
     )
 
@@ -231,7 +265,7 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_message(
                 chat_id=cid,
                 text=(
-                    f"Bot challenge detected 🤖\n"
+                    "Bot challenge detected 🤖\n"
                     "Use /link to re-authenticate your Walmart account, then /run again.\n"
                     f"Job: `{job_id}`"
                 ),
@@ -262,7 +296,6 @@ async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     session_file = Path(SESSION_PATH)
 
-    # If a session already exists and user hasn't confirmed, ask first
     if session_file.exists() and not confirming:
         await update.message.reply_text(
             "A Walmart session already exists.\n"
@@ -271,7 +304,6 @@ async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    # Close any stale linker for this chat
     await _close_linker(chat_id)
 
     await update.message.reply_text(
