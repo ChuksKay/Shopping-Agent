@@ -548,11 +548,17 @@ async def link_done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return
 
+        await update.message.reply_text(
+            "Login detected — saving your session, please wait a moment..."
+        )
         await linker.save_session(SESSION_PATH)
         await linker.close()
         _link_sessions.pop(chat_id, None)
 
-        await update.message.reply_text("Walmart linked ✅")
+        await update.message.reply_text(
+            "Walmart linked ✅\n"
+            "Your session is saved. Send /run whenever you're ready to shop."
+        )
 
     except Exception as exc:
         logger.error("Error in /link_done: %s", exc, exc_info=True)

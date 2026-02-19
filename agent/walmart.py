@@ -623,25 +623,63 @@ class WalmartLinker:
         await asyncio.sleep(1)
 
     async def is_logged_in(self) -> bool:
+        """
+        Returns True only if the browser shows clear evidence of an authenticated session.
+        Never returns True based on URL alone — that caused guest sessions to be saved.
+        """
         if self.page is None:
             return False
         try:
             url = self.page.url
-            if "signin" in url or "login" in url:
+            # Bail immediately on auth/block pages
+            if any(x in url for x in ("signin", "login", "blocked", "captcha")):
                 return False
+
+            # Wait a moment for post-login JS to finish rendering the account UI
+            await asyncio.sleep(1.5)
+
+            # Check for account-menu DOM elements
             for sel in _LOGGED_IN_INDICATORS:
                 try:
                     if await self.page.locator(sel).count() > 0:
                         return True
                 except Exception:
                     pass
-            if "walmart.ca" in url:
-                return True
+
+            # Fallback: check page source for server-rendered auth signals
+            try:
+                content = await self.page.content()
+                auth_signals = [
+                    "sign-out", "Sign out", "Sign Out",
+                    '"isLoggedIn":true', '"isSignedIn":true',
+                    "account-menu", "My Account",
+                ]
+                if any(sig in content for sig in auth_signals):
+                    return True
+            except Exception:
+                pass
+
         except Exception:
             pass
         return False
 
     async def save_session(self, path: str) -> None:
+        """
+        Navigate to the account page first so all post-login cookies are set,
+        then persist the full session to disk.
+        """
+        # Navigating to the account page forces Walmart's servers to issue
+        # all auth cookies (some are set lazily after the login redirect).
+        try:
+            await self.page.goto(
+                f"{WALMART_BASE}/en/account",
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+            await asyncio.sleep(2)   # let cookie-setting JS finish
+        except Exception as exc:
+            logger.warning("Could not navigate to account page before save", extra={"error": str(exc)})
+
         dest = Path(path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         await self._context.storage_state(path=str(dest))
