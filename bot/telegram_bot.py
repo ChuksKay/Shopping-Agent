@@ -55,30 +55,30 @@ _HELP = """
 *Caleb Shopping Agent* 🛒
 
 *Commands*
-/set `<postal>` `[delivery|pickup]` — set postal code & fulfilment mode
+/set `<postal>` `[delivery|pickup]` - set postal code & fulfilment mode
   _e.g. /set M5V3A1 delivery_
 
-/add `<items>` — add items (comma or newline separated, qty prefix ok)
+/add `<items>` - add items (comma or newline separated, qty prefix ok)
   _e.g. /add milk, 2x eggs, bread_
 
-/list — show current list
-/clear — clear current list
+/list - show current list
+/clear - clear current list
 
-/run — build your Walmart\.ca cart
-/status `<job_id>` — check a job
+/run - build your Walmart.ca cart
+/status `<job_id>` - check a job
 
-/link — link your Walmart account \(opens visible browser\)
-/link confirm — overwrite existing session
-/link\_done — save session after logging in
+/link - link your Walmart account (opens visible browser)
+/link confirm - overwrite existing session
+/link_done - save session after logging in
 
-/help — show this message
+/help - show this message
 """.strip()
 
 
 # ── /help & /start ─────────────────────────────────────────────────────────────
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(_HELP, parse_mode="MarkdownV2")
+    await update.message.reply_text(_HELP, parse_mode="Markdown")
 
 
 # ── /set ───────────────────────────────────────────────────────────────────────
@@ -215,9 +215,9 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await create_job(job_id, chat_id)
 
     await update.message.reply_text(
-        f"Building your Walmart\.ca cart\.\.\. 🛒\nJob ID: `{job_id}`\n"
-        "I'll send you the link when it's ready\.",
-        parse_mode="MarkdownV2",
+        f"Building your Walmart.ca cart... 🛒\nJob ID: `{job_id}`\n"
+        "I'll send you the link when it's ready.",
+        parse_mode="Markdown",
     )
 
     async def on_done(cid: int, url: str | None, status: str, error: str | None) -> None:
@@ -276,8 +276,7 @@ async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await update.message.reply_text(
         "Opening Walmart.ca in a browser on your machine...\n"
-        "Log in manually, then send /link\\_done when finished.",
-        parse_mode="MarkdownV2",
+        "Log in manually, then send /link_done when finished."
     )
 
     linker = WalmartLinker()
@@ -309,8 +308,7 @@ async def link_done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if not await linker.is_logged_in():
             await update.message.reply_text(
                 "Doesn't look like you're logged in yet.\n"
-                "Complete the login in the browser window, then send /link\\_done again.",
-                parse_mode="MarkdownV2",
+                "Complete the login in the browser window, then send /link_done again."
             )
             return
 
