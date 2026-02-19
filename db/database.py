@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     status     TEXT    NOT NULL DEFAULT 'pending',
     result_url TEXT,
     error      TEXT,
+    screenshot TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
@@ -52,6 +53,12 @@ async def init_db() -> None:
                 await db.execute(f"ALTER TABLE items ADD COLUMN {col} {typedef}")
             except Exception:
                 pass  # column already exists
+
+        # Migrate existing jobs table
+        try:
+            await db.execute("ALTER TABLE jobs ADD COLUMN screenshot TEXT")
+        except Exception:
+            pass  # column already exists
 
         await db.commit()
 
@@ -157,16 +164,17 @@ async def update_job(
     status: str,
     result_url: str | None = None,
     error: str | None = None,
+    screenshot: str | None = None,
 ) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
             UPDATE jobs
-            SET status = ?, result_url = ?, error = ?,
+            SET status = ?, result_url = ?, error = ?, screenshot = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE job_id = ?
             """,
-            (status, result_url, error, job_id),
+            (status, result_url, error, screenshot, job_id),
         )
         await db.commit()
 

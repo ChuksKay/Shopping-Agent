@@ -1,9 +1,20 @@
 """
 Background job worker.
 
-- worker_loop()       polls SQLite for 'pending' jobs every 3 s and runs them.
-- process_job()       runs a single job (Walmart cart build) and fires a callback.
-- register_callback() lets the bot register a coroutine to call on completion.
+- worker_loop()       polls SQLite for 'pending' jobs every 3 s.
+- process_job()       runs a single Walmart cart build and fires a callback.
+- register_callback() lets the Telegram bot register a coroutine on completion.
+
+Callback signature:
+    async def cb(chat_id, cart_url, status, error, result) -> None
+
+result dict (always present, even on failure):
+    {
+        "cart_url":   str | None,
+        "added":      list[str],   # labels of items added
+        "failed":     list[str],   # labels of items that failed all retries
+        "screenshot": str | None,  # local path to failure screenshot
+    }
 """
 
 import asyncio
@@ -14,8 +25,9 @@ from agent.walmart import WalmartAgent, BotChallengeError
 
 logger = logging.getLogger(__name__)
 
-# job_id → async callable(chat_id, url, status, error)
-_callbacks: dict[str, any] = {}
+_callbacks: dict[str, object] = {}
+
+_EMPTY_RESULT: dict = {"cart_url": None, "added": [], "failed": [], "screenshot": None}
 
 
 def register_callback(job_id: str, cb) -> None:
@@ -27,68 +39,80 @@ async def process_job(job: dict) -> None:
     chat_id = job["chat_id"]
 
     await update_job(job_id, "running")
-    logger.info("Processing job %s for chat %d", job_id, chat_id)
+    logger.info("Job started", extra={"job_id": job_id, "chat_id": chat_id})
 
-    try:
-        chat = await get_chat(chat_id)
-        postal_code = chat["postal_code"] if chat else ""
+    chat = await get_chat(chat_id)
+    postal_code = chat["postal_code"] if chat else ""
 
-        item_rows = await get_items(chat_id)
-        if not item_rows:
-            await update_job(job_id, "failed", error="No items in list")
-            await _fire(job_id, chat_id, None, "failed", "No items in list")
-            return
+    item_rows = await get_items(chat_id)
+    if not item_rows:
+        await update_job(job_id, "failed", error="No items in list")
+        await _fire(job_id, chat_id, None, "failed", "No items in list", _EMPTY_RESULT)
+        return
 
-        # Build item dicts for the agent — include brand for smarter search
-        items = [
-            {
-                "name":      row["text"],
-                "qty":       row["qty"],
-                "max_price": row.get("max_price"),
-                "brand":     row.get("brand"),
-            }
-            for row in item_rows
-        ]
+    items = [
+        {
+            "name":      row["text"],
+            "qty":       row["qty"],
+            "max_price": row.get("max_price"),
+            "brand":     row.get("brand"),
+        }
+        for row in item_rows
+    ]
 
-        async with WalmartAgent(postal_code=postal_code) as agent:
-            cart_url = await agent.build_cart(items)
+    async with WalmartAgent(postal_code=postal_code) as agent:
+        try:
+            result = await agent.build_cart(items, job_id=job_id)
 
-        await update_job(job_id, "done", result_url=cart_url)
-        await _fire(job_id, chat_id, cart_url, "done")
+            await update_job(job_id, "done", result_url=result["cart_url"])
+            logger.info(
+                "Job done",
+                extra={
+                    "job_id":  job_id,
+                    "added":   len(result["added"]),
+                    "failed":  len(result["failed"]),
+                    "cart_url": result["cart_url"],
+                },
+            )
+            await _fire(job_id, chat_id, result["cart_url"], "done", result=result)
 
-    except BotChallengeError as exc:
-        msg = str(exc)
-        logger.warning("Job %s — bot challenge: %s", job_id, msg)
-        await update_job(job_id, "needs_user", error=msg)
-        await _fire(job_id, chat_id, None, "needs_user", msg)
+        except BotChallengeError as exc:
+            screenshot = agent.last_screenshot
+            msg = "Walmart needs verification"
+            logger.warning("Bot challenge", extra={"job_id": job_id, "error": str(exc)})
+            await update_job(job_id, "needs_user", error=msg, screenshot=screenshot)
+            result = {**_EMPTY_RESULT, "screenshot": screenshot}
+            await _fire(job_id, chat_id, None, "needs_user", msg, result)
 
-    except Exception as exc:
-        msg = str(exc)
-        logger.error("Job %s failed: %s", job_id, msg, exc_info=True)
-        await update_job(job_id, "failed", error=msg)
-        await _fire(job_id, chat_id, None, "failed", msg)
+        except Exception as exc:
+            screenshot = agent.last_screenshot
+            msg = str(exc)
+            logger.error("Job failed", extra={"job_id": job_id, "error": msg}, exc_info=True)
+            await update_job(job_id, "failed", error=msg, screenshot=screenshot)
+            result = {**_EMPTY_RESULT, "screenshot": screenshot}
+            await _fire(job_id, chat_id, None, "failed", msg, result)
 
 
 async def _fire(
     job_id: str,
     chat_id: int,
-    url: str | None,
+    cart_url: str | None,
     status: str,
     error: str | None = None,
+    result: dict | None = None,
 ) -> None:
     cb = _callbacks.pop(job_id, None)
     if cb:
         try:
-            await cb(chat_id, url, status, error)
+            await cb(chat_id, cart_url, status, error, result or _EMPTY_RESULT)
         except Exception as exc:
-            logger.error("Callback error for job %s: %s", job_id, exc)
+            logger.error("Callback error", extra={"job_id": job_id, "error": str(exc)})
 
 
 _running: set[str] = set()
 
 
 async def worker_loop() -> None:
-    """Continuously poll for pending jobs and launch them as async tasks."""
     logger.info("Job worker started")
     while True:
         try:
@@ -105,6 +129,6 @@ async def worker_loop() -> None:
 
                     asyncio.create_task(_run(job))
         except Exception as exc:
-            logger.error("worker_loop error: %s", exc, exc_info=True)
+            logger.error("worker_loop error", extra={"error": str(exc)}, exc_info=True)
 
         await asyncio.sleep(3)

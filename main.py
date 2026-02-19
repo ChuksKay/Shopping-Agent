@@ -2,6 +2,7 @@
 Caleb Shopping Agent — main entry point.
 
 Starts:
+    • Structured JSON logging
     • SQLite DB init
     • Job worker (background asyncio task)
     • Telegram bot (long polling)
@@ -9,6 +10,7 @@ Starts:
 """
 
 import asyncio
+import json
 import logging
 import os
 import uuid
@@ -26,10 +28,50 @@ from db.database import create_job, get_items, get_job, init_db
 from bot.telegram_bot import create_bot_app
 from workers.job_worker import process_job, worker_loop
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+
+# ── Structured JSON logging ────────────────────────────────────────────────────
+
+class _JSONFormatter(logging.Formatter):
+    """One JSON object per log line — machine-readable and grep-friendly."""
+
+    _SKIP = frozenset({
+        "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+        "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+        "created", "msecs", "relativeCreated", "thread", "threadName",
+        "processName", "process", "message", "taskName",
+    })
+
+    def format(self, record: logging.LogRecord) -> str:
+        record.message = record.getMessage()
+        out: dict = {
+            "ts":     self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level":  record.levelname,
+            "logger": record.name,
+            "msg":    record.message,
+        }
+        if record.exc_info:
+            out["exc"] = self.formatException(record.exc_info)
+        # Bubble up any extra= fields passed by callers
+        for k, v in record.__dict__.items():
+            if k not in self._SKIP:
+                out[k] = v
+        return json.dumps(out, default=str)
+
+
+def setup_logging(level: str = "INFO") -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(_JSONFormatter())
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    # Keep uvicorn access logs readable but structured
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logging.getLogger(name).handlers = []
+        logging.getLogger(name).propagate = True
+
+
+setup_logging(os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
 
@@ -37,14 +79,11 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Init DB
     await init_db()
     logger.info("Database ready")
 
-    # Start background job worker
     worker_task = asyncio.create_task(worker_loop())
 
-    # Start Telegram bot (long polling)
     bot = create_bot_app()
     await bot.initialize()
     await bot.start()
@@ -53,8 +92,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Graceful shutdown
-    logger.info("Shutting down...")
+    logger.info("Shutting down")
     await bot.updater.stop()
     await bot.stop()
     await bot.shutdown()
@@ -84,7 +122,6 @@ async def api_create_job(req: CreateJobRequest):
     job_id = str(uuid.uuid4())[:8]
     job = await create_job(job_id, req.chat_id)
     asyncio.create_task(process_job(job))
-
     return {"job_id": job_id, "status": "pending"}
 
 
@@ -104,4 +141,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8000")),
         reload=False,
+        log_config=None,   # let our handler take over
     )

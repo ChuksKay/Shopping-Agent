@@ -9,6 +9,9 @@ Commands:
     /clear                  clear the list
     /run                    build the Walmart.ca cart
     /status <job_id>        check a job
+    /screenshot <job_id>    send the failure screenshot
+    /resume <job_id>        open headful browser to solve bot challenge
+    /continue <job_id>      verification done; resume cart build
     /link [confirm]         link your Walmart account (headful browser)
     /link_done              confirm login is complete and save session
 """
@@ -29,7 +32,8 @@ from telegram.ext import (
 )
 
 from agent.parser import parse_items
-from agent.walmart import WalmartLinker
+from agent.walmart import WalmartLinker, WalmartResumeSession
+from bot.ai_handler import handle_message as ai_handle
 from db.database import (
     add_items,
     clear_items,
@@ -37,6 +41,7 @@ from db.database import (
     get_chat,
     get_items,
     get_job,
+    update_job,
     upsert_chat,
 )
 from workers.job_worker import process_job, register_callback
@@ -49,6 +54,9 @@ SESSION_PATH: str = os.getenv("SESSION_PATH", "sessions/walmart_session.json")
 # In-memory map of chat_id → active WalmartLinker (for /link flow)
 _link_sessions: dict[int, WalmartLinker] = {}
 
+# In-memory map of job_id → active WalmartResumeSession (for /resume flow)
+_resume_sessions: dict[str, WalmartResumeSession] = {}
+
 # ── Help text ──────────────────────────────────────────────────────────────────
 
 _HELP = """
@@ -60,18 +68,21 @@ _HELP = """
 
 /add `<items>` - add items (comma or newline separated)
   Supports qty, brand, max price:
-  _2x bread_
-  _indomie chicken x2_
-  _milk 2% 4L (max $8)_
-  _eggs 12 pack_
-  _noodles brand:indomie x3_
+  _2x bread_, _indomie chicken x2_
+  _milk 2% 4L (max $8)_, _noodles brand:indomie x3_
 
 /list - show current list
 /clear - clear current list
 
 /run - build your Walmart.ca cart
 /status `<job_id>` - check a job
+/screenshot `<job_id>` - see the failure screenshot
 
+*If Walmart shows a bot challenge:*
+/resume `<job_id>` - open browser so you can verify
+/continue `<job_id>` - done verifying; resume cart build
+
+*Account linking*
 /link - link your Walmart account (opens visible browser)
 /link confirm - overwrite existing session
 `/link_done` - save session after logging in
@@ -254,11 +265,36 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode="Markdown",
     )
 
-    async def on_done(cid: int, url: str | None, status: str, error: str | None) -> None:
+    async def on_done(
+        cid: int,
+        url: str | None,
+        status: str,
+        error: str | None = None,
+        result: dict | None = None,
+    ) -> None:
+        res = result or {}
+        added: list[str] = res.get("added", [])
+        failed: list[str] = res.get("failed", [])
+        total = len(added) + len(failed)
+
         if status == "done" and url:
+            if failed:
+                summary = (
+                    f"⚠️ {len(added)}/{total} items added\n"
+                    + (("✅ " + ", ".join(added) + "\n") if added else "")
+                    + "❌ Failed: " + ", ".join(failed)
+                )
+            else:
+                summary = f"✅ All {total} item(s) added"
+
             await context.bot.send_message(
                 chat_id=cid,
-                text=f"Cart ready! 🎉\n{url}\n\nJob: `{job_id}`",
+                text=(
+                    f"Cart ready! 🎉\n{summary}\n\n"
+                    f"🛒 {url}\n\n"
+                    "_Make sure you're logged into your Walmart account in your browser before opening the link._\n\n"
+                    f"Job: `{job_id}`"
+                ),
                 parse_mode="Markdown",
             )
         elif status == "needs_user":
@@ -266,20 +302,188 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 chat_id=cid,
                 text=(
                     "Bot challenge detected 🤖\n"
-                    "Use /link to re-authenticate your Walmart account, then /run again.\n"
+                    f"Use /resume `{job_id}` to solve it manually, then the cart build will resume.\n\n"
                     f"Job: `{job_id}`"
                 ),
                 parse_mode="Markdown",
             )
         else:
+            fail_note = ""
+            if failed:
+                fail_note = "\nFailed items: " + ", ".join(failed)
             await context.bot.send_message(
                 chat_id=cid,
-                text=f"Cart build failed ❌\nJob: `{job_id}`\nError: {error or 'Unknown'}",
+                text=f"Cart build failed ❌\nJob: `{job_id}`\nError: {error or 'Unknown'}{fail_note}",
                 parse_mode="Markdown",
             )
 
     register_callback(job_id, on_done)
     job = await get_job(job_id)
+    asyncio.create_task(process_job(job))
+
+
+# ── /screenshot ────────────────────────────────────────────────────────────────
+
+async def screenshot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /screenshot <job_id>")
+        return
+
+    job_id = args[0]
+    path = Path(f"storage/screenshots/{job_id}.png")
+
+    if not path.exists():
+        await update.message.reply_text(
+            f"No screenshot found for job `{job_id}`.", parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_photo(
+        photo=open(path, "rb"),
+        caption=f"Screenshot for job `{job_id}`",
+        parse_mode="Markdown",
+    )
+
+
+# ── /resume ────────────────────────────────────────────────────────────────────
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /resume <job_id>  — open a headful browser so the user can solve the
+    bot challenge, then send /continue <job_id> when done.
+    """
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /resume <job_id>")
+        return
+
+    job_id = args[0]
+    job = await get_job(job_id)
+    if not job:
+        await update.message.reply_text(
+            f"Job `{job_id}` not found.", parse_mode="Markdown"
+        )
+        return
+
+    if job["status"] != "needs_user":
+        await update.message.reply_text(
+            f"Job `{job_id}` is `{job['status']}` — only `needs_user` jobs can be resumed.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Close any stale session for this job
+    await _close_resume_session(job_id)
+
+    chat = await get_chat(job["chat_id"])
+    postal_code = chat["postal_code"] if chat else ""
+
+    await update.message.reply_text(
+        f"Opening Walmart.ca in a browser on your machine...\n"
+        f"Complete any CAPTCHA or verification, then send `/continue {job_id}` when done.",
+        parse_mode="Markdown",
+    )
+
+    session = WalmartResumeSession(postal_code=postal_code)
+    _resume_sessions[job_id] = session
+    try:
+        await session.start()
+    except Exception as exc:
+        _resume_sessions.pop(job_id, None)
+        logger.error("Failed to open resume browser", extra={"job_id": job_id, "error": str(exc)})
+        await update.message.reply_text(f"Failed to open browser: {exc}")
+
+
+# ── /continue ──────────────────────────────────────────────────────────────────
+
+async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /continue <job_id>  — called after the user has solved the bot challenge
+    in the headful browser opened by /resume.  Saves the fresh session,
+    closes the browser, resets the job, and re-runs the cart build.
+    """
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /continue <job_id>")
+        return
+
+    job_id = args[0]
+    session = _resume_sessions.pop(job_id, None)
+    if session is None:
+        await update.message.reply_text(
+            f"No active resume session for `{job_id}`.\n"
+            "Send /resume first.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        await session.save_session()
+        await session.close()
+    except Exception as exc:
+        logger.warning("Error closing resume session", extra={"job_id": job_id, "error": str(exc)})
+
+    job = await get_job(job_id)
+    if not job:
+        await update.message.reply_text(
+            f"Job `{job_id}` not found.", parse_mode="Markdown"
+        )
+        return
+
+    chat_id = job["chat_id"]
+    await update.message.reply_text(
+        f"Verification saved! Resuming cart build for job `{job_id}`... 🛒",
+        parse_mode="Markdown",
+    )
+
+    # Reset job to pending so process_job() will run it again
+    await update_job(job_id, "pending", error=None, screenshot=None)
+
+    async def on_done(
+        cid: int,
+        url: str | None,
+        status: str,
+        error: str | None = None,
+        result: dict | None = None,
+    ) -> None:
+        res = result or {}
+        added: list[str] = res.get("added", [])
+        failed: list[str] = res.get("failed", [])
+        total = len(added) + len(failed)
+
+        if status == "done" and url:
+            if failed:
+                summary = (
+                    f"⚠️ {len(added)}/{total} items added\n"
+                    + (("✅ " + ", ".join(added) + "\n") if added else "")
+                    + "❌ Failed: " + ", ".join(failed)
+                )
+            else:
+                summary = f"✅ All {total} item(s) added"
+            await context.bot.send_message(
+                chat_id=cid,
+                text=f"Cart ready! 🎉\n{summary}\n\n🛒 {url}\n\nJob: `{job_id}`",
+                parse_mode="Markdown",
+            )
+        elif status == "needs_user":
+            await context.bot.send_message(
+                chat_id=cid,
+                text=(
+                    "Bot challenge detected again 🤖\n"
+                    f"Use /resume `{job_id}` to try once more.",
+                ),
+                parse_mode="Markdown",
+            )
+        else:
+            fail_note = ("\nFailed items: " + ", ".join(failed)) if failed else ""
+            await context.bot.send_message(
+                chat_id=cid,
+                text=f"Cart build failed ❌\nJob: `{job_id}`\nError: {error or 'Unknown'}{fail_note}",
+                parse_mode="Markdown",
+            )
+
+    register_callback(job_id, on_done)
     asyncio.create_task(process_job(job))
 
 
@@ -356,10 +560,70 @@ async def link_done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await _close_linker(chat_id)
 
 
-# ── Fallback ───────────────────────────────────────────────────────────────────
+# ── AI conversational handler (catches all non-command messages) ───────────────
 
-async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Unknown command. Use /help to see available commands.")
+async def ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    text    = (update.message.text or "").strip()
+    if not text:
+        return
+
+    async def send(msg: str) -> None:
+        await context.bot.send_message(chat_id=chat_id, text=msg)
+
+    async def trigger_job(job_id: str) -> None:
+        async def on_done(
+            cid: int,
+            url: str | None,
+            status: str,
+            error: str | None = None,
+            result: dict | None = None,
+        ) -> None:
+            res    = result or {}
+            added  = res.get("added",  [])
+            failed = res.get("failed", [])
+            total  = len(added) + len(failed)
+
+            if status == "done" and url:
+                summary = (
+                    (
+                        f"⚠️ {len(added)}/{total} items added\n"
+                        + (("✅ " + ", ".join(added) + "\n") if added else "")
+                        + "❌ Failed: " + ", ".join(failed)
+                    ) if failed else f"✅ All {total} item(s) added"
+                )
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=(
+                        f"Cart ready! 🎉\n{summary}\n\n"
+                        f"🛒 {url}\n\n"
+                        "_Make sure you're logged into Walmart in your browser before opening._\n\n"
+                        f"Job: `{job_id}`"
+                    ),
+                    parse_mode="Markdown",
+                )
+            elif status == "needs_user":
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=(
+                        "Walmart showed a verification challenge 🤖\n"
+                        f"Send /resume `{job_id}` to solve it, then the cart build will continue."
+                    ),
+                    parse_mode="Markdown",
+                )
+            else:
+                fail_note = ("\nFailed: " + ", ".join(failed)) if failed else ""
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=f"Cart build failed ❌\nError: {error or 'Unknown'}{fail_note}\nJob: `{job_id}`",
+                    parse_mode="Markdown",
+                )
+
+        register_callback(job_id, on_done)
+        job = await get_job(job_id)
+        asyncio.create_task(process_job(job))
+
+    await ai_handle(chat_id, text, send, trigger_job)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -369,6 +633,15 @@ async def _close_linker(chat_id: int) -> None:
     if linker:
         try:
             await linker.close()
+        except Exception:
+            pass
+
+
+async def _close_resume_session(job_id: str) -> None:
+    session = _resume_sessions.pop(job_id, None)
+    if session:
+        try:
+            await session.close()
         except Exception:
             pass
 
@@ -389,8 +662,11 @@ def create_bot_app() -> Application:
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("run", run_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("screenshot", screenshot_command))
+    app.add_handler(CommandHandler("resume", resume_command))
+    app.add_handler(CommandHandler("continue", continue_command))
     app.add_handler(CommandHandler("link", link_command))
     app.add_handler(CommandHandler("link_done", link_done_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_message))
 
     return app

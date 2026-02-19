@@ -9,6 +9,7 @@ Classes:
 import asyncio
 import logging
 import os
+import random
 from pathlib import Path
 
 from playwright.async_api import (
@@ -24,78 +25,78 @@ logger = logging.getLogger(__name__)
 SESSION_PATH: str = os.getenv("SESSION_PATH", "sessions/walmart_session.json")
 HEADLESS: bool = os.getenv("HEADLESS", "true").lower() == "true"
 WALMART_BASE = "https://www.walmart.ca"
+SCREENSHOT_DIR = Path("storage/screenshots")
 
-# Use a real, recent Chrome UA — no "HeadlessChrome" in the string
 _USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) "
+    "Gecko/20100101 Firefox/133.0"
 )
 
-# Launch flags that strip Playwright's automation signals
-_STEALTH_ARGS = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-blink-features=AutomationControlled",  # removes navigator.webdriver
-    "--disable-infobars",
-    "--disable-dev-shm-usage",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-features=IsolateOrigins,site-per-process",
-    "--disable-extensions",
-]
+_STEALTH_ARGS: list[str] = []   # Firefox ignores Chrome-specific flags
 
-# JS injected before every page load to mask remaining automation fingerprints
 _STEALTH_SCRIPT = """
-// Remove the main automation flag
+// ── navigator.webdriver ───────────────────────────────────────────────────────
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
-// Mock a real Chrome runtime
-window.chrome = {
-    runtime: {},
-    loadTimes: function() {},
-    csi: function() {},
-    app: {}
-};
-
-// Realistic plugin list
-Object.defineProperty(navigator, 'plugins', {
-    get: () => {
-        const arr = [
-            { name: 'Chrome PDF Plugin',   filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            { name: 'Chrome PDF Viewer',   filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-            { name: 'Native Client',       filename: 'internal-nacl-plugin', description: '' },
-        ];
-        arr.item   = i => arr[i];
-        arr.namedItem = n => arr.find(p => p.name === n) || null;
-        arr.refresh = () => {};
-        return arr;
-    }
-});
-
-// Languages consistent with locale
+// ── Language / locale ─────────────────────────────────────────────────────────
 Object.defineProperty(navigator, 'languages', { get: () => ['en-CA', 'en-US', 'en'] });
+Object.defineProperty(navigator, 'language',  { get: () => 'en-CA' });
 
-// Platform
-Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' });
+// ── Platform / hardware ───────────────────────────────────────────────────────
+Object.defineProperty(navigator, 'platform',            { get: () => 'MacIntel' });
+Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+Object.defineProperty(navigator, 'maxTouchPoints',      { get: () => 0 });
 
-// Permissions — prevent detection via permission probe
-const _origPermQuery = window.navigator.permissions.query.bind(navigator.permissions);
-window.navigator.permissions.query = params =>
-    params.name === 'notifications'
-        ? Promise.resolve({ state: Notification.permission })
-        : _origPermQuery(params);
+// ── Screen dimensions (consistent with 1280×900 viewport) ────────────────────
+Object.defineProperty(screen, 'width',       { get: () => 1280 });
+Object.defineProperty(screen, 'height',      { get: () => 900 });
+Object.defineProperty(screen, 'availWidth',  { get: () => 1280 });
+Object.defineProperty(screen, 'availHeight', { get: () => 860 });
+Object.defineProperty(screen, 'colorDepth',  { get: () => 24 });
+Object.defineProperty(screen, 'pixelDepth',  { get: () => 24 });
+Object.defineProperty(window, 'outerWidth',  { get: () => 1280 });
+Object.defineProperty(window, 'outerHeight', { get: () => 900 });
 
-// WebGL — mask Mesa/SwiftShader (headless tell-tale)
-const _getParam = WebGLRenderingContext.prototype.getParameter;
-WebGLRenderingContext.prototype.getParameter = function(p) {
-    if (p === 37445) return 'Intel Inc.';
-    if (p === 37446) return 'Intel Iris OpenGL Engine';
-    return _getParam.call(this, p);
+// ── Permissions ───────────────────────────────────────────────────────────────
+const _origPermQuery = navigator.permissions.query.bind(navigator.permissions);
+navigator.permissions.query = (params) => {
+    if (params.name === 'notifications')
+        return Promise.resolve({ state: typeof Notification !== 'undefined' ? Notification.permission : 'default' });
+    return _origPermQuery(params).catch(() => Promise.resolve({ state: 'prompt' }));
 };
+
+// ── WebGL vendor/renderer ─────────────────────────────────────────────────────
+try {
+    const _getParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(p) {
+        if (p === 37445) return 'Intel Inc.';
+        if (p === 37446) return 'Intel Iris Pro OpenGL Engine';
+        return _getParam.call(this, p);
+    };
+} catch(e) {}
+try {
+    const _getParam2 = WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter = function(p) {
+        if (p === 37445) return 'Intel Inc.';
+        if (p === 37446) return 'Intel Iris Pro OpenGL Engine';
+        return _getParam2.call(this, p);
+    };
+} catch(e) {}
+
+// ── Canvas noise ──────────────────────────────────────────────────────────────
+try {
+    const _origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function(type, ...args) {
+        const ctx = _origGetContext.call(this, type, ...args);
+        if (ctx && type === '2d') {
+            const _fill = ctx.fillText.bind(ctx);
+            ctx.fillText = (t, x, y, ...r) => _fill(t, x + Math.random() * 0.05, y, ...r);
+        }
+        return ctx;
+    };
+} catch(e) {}
 """
 
-# Selectors for "Add to cart" — tried in order
 _ADD_TO_CART = [
     '[data-automation-id="add-to-cart-btn"]',
     'button[aria-label*="Add to cart"]',
@@ -104,7 +105,6 @@ _ADD_TO_CART = [
     'button:has-text("Add to Cart")',
 ]
 
-# Selectors that indicate a successful login
 _LOGGED_IN_INDICATORS = [
     '[data-automation-id="account-menu"]',
     'a[href*="/account/"]',
@@ -116,6 +116,64 @@ _LOGGED_IN_INDICATORS = [
 
 class BotChallengeError(Exception):
     """Raised when Walmart presents a bot-detection or CAPTCHA page."""
+
+
+# ── Human-like timing helpers ──────────────────────────────────────────────────
+
+async def _delay(lo: float = 0.8, hi: float = 2.2) -> None:
+    """Random sleep between lo and hi seconds."""
+    await asyncio.sleep(random.uniform(lo, hi))
+
+
+async def _short_delay() -> None:
+    await asyncio.sleep(random.uniform(0.15, 0.45))
+
+
+async def _human_mouse_move(page: Page, x: float, y: float) -> None:
+    """Move mouse to (x, y) via a random intermediate waypoint."""
+    mid_x = random.uniform(200, 900)
+    mid_y = random.uniform(150, 600)
+    await page.mouse.move(mid_x, mid_y, steps=random.randint(4, 8))
+    await asyncio.sleep(random.uniform(0.05, 0.15))
+    await page.mouse.move(x, y, steps=random.randint(6, 14))
+
+
+async def _human_click(page: Page, locator) -> None:
+    """Scroll element into view, move mouse naturally, then click."""
+    try:
+        await locator.scroll_into_view_if_needed(timeout=5000)
+    except Exception:
+        pass
+    box = None
+    try:
+        box = await locator.bounding_box()
+    except Exception:
+        pass
+    if box:
+        x = box["x"] + box["width"] * random.uniform(0.25, 0.75)
+        y = box["y"] + box["height"] * random.uniform(0.25, 0.75)
+        await _human_mouse_move(page, x, y)
+        await asyncio.sleep(random.uniform(0.05, 0.18))
+        await page.mouse.click(x, y)
+    else:
+        await locator.click()
+
+
+async def _human_type(page: Page, locator, text: str) -> None:
+    """Click field and type each character with randomised inter-key delay."""
+    await _human_click(page, locator)
+    await asyncio.sleep(random.uniform(0.2, 0.5))
+    for char in text:
+        await page.keyboard.type(char, delay=random.randint(60, 160))
+
+
+async def _random_scroll(page: Page) -> None:
+    """Scroll down a little, pause, scroll back — mimics a human scanning the page."""
+    dist = random.randint(200, 500)
+    await page.mouse.wheel(0, dist)
+    await asyncio.sleep(random.uniform(0.4, 1.0))
+    await page.mouse.wheel(0, -random.randint(50, 150))
+    await asyncio.sleep(random.uniform(0.2, 0.5))
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -130,17 +188,10 @@ async def _check_bot_challenge(page: Page) -> None:
         snippet = ""
 
     triggers = [
-        "access denied",
-        "robot check",
-        "captcha",
-        "unusual traffic",
-        "verify you are human",
-        "checking your browser",
-        "ddos-guard",
-        "please enable cookies",
-        "sorry, you have been blocked",
-        "403 forbidden",
-        "just a moment",
+        "access denied", "robot check", "captcha", "unusual traffic",
+        "verify you are human", "checking your browser", "ddos-guard",
+        "please enable cookies", "sorry, you have been blocked",
+        "403 forbidden", "just a moment",
     ]
     combined = f"{title} {url} {snippet}"
     for t in triggers:
@@ -169,15 +220,10 @@ async def _dismiss_overlays(page: Page) -> None:
         try:
             el = page.locator(sel).first
             if await el.is_visible():
-                await el.click()
-                await asyncio.sleep(0.4)
+                await _human_click(page, el)
+                await asyncio.sleep(random.uniform(0.3, 0.6))
         except Exception:
             pass
-
-
-def _save_session_sync(context: BrowserContext, path: str) -> None:
-    """Convenience wrapper — call via await context.storage_state(path=path)."""
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
 # ── WalmartAgent ───────────────────────────────────────────────────────────────
@@ -185,10 +231,10 @@ def _save_session_sync(context: BrowserContext, path: str) -> None:
 class WalmartAgent:
     """
     Headless Playwright agent that builds a Walmart.ca cart.
-    Use as an async context manager:
 
         async with WalmartAgent(postal_code="M5V3A1") as agent:
-            cart_url = await agent.build_cart([("milk", 2), ("eggs", 1)])
+            result = await agent.build_cart(items, job_id="abc123")
+            # result = {"cart_url": ..., "added": [...], "failed": [...], "screenshot": ...}
     """
 
     def __init__(self, postal_code: str = "", headless: bool = HEADLESS):
@@ -198,11 +244,14 @@ class WalmartAgent:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self.page: Page | None = None
+        # Set by build_cart if a screenshot is taken on failure
+        self.last_screenshot: str | None = None
 
     async def __aenter__(self) -> "WalmartAgent":
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
+        self._browser = await self._pw.firefox.launch(
             headless=self.headless,
+            # Firefox: different TLS fingerprint that Akamai doesn't block
             args=_STEALTH_ARGS,
         )
         ctx_kwargs: dict = {
@@ -210,12 +259,21 @@ class WalmartAgent:
             "user_agent": _USER_AGENT,
             "locale": "en-CA",
             "timezone_id": "America/Toronto",
-            "extra_http_headers": {"Accept-Language": "en-CA,en;q=0.9"},
+            "extra_http_headers": {
+                "Accept-Language": "en-CA,en-US;q=0.9,en;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+            },
         }
         session = Path(SESSION_PATH)
         if session.exists():
             ctx_kwargs["storage_state"] = str(session)
-            logger.info("Loaded Walmart session from %s", SESSION_PATH)
+            logger.info("Loaded Walmart session", extra={"session": SESSION_PATH})
 
         self._context = await self._browser.new_context(**ctx_kwargs)
         await self._context.add_init_script(_STEALTH_SCRIPT)
@@ -236,6 +294,18 @@ class WalmartAgent:
     async def _dismiss(self) -> None:
         await _dismiss_overlays(self.page)
 
+    async def _safe_screenshot(self, job_id: str) -> str | None:
+        """Capture current page to storage/screenshots/{job_id}.png. Never raises."""
+        try:
+            SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+            path = SCREENSHOT_DIR / f"{job_id}.png"
+            await self.page.screenshot(path=str(path), full_page=False)
+            logger.info("Screenshot saved", extra={"path": str(path), "job_id": job_id})
+            return str(path)
+        except Exception as exc:
+            logger.warning("Screenshot failed", extra={"job_id": job_id, "error": str(exc)})
+            return None
+
     async def _set_postal_code(self) -> None:
         if not self.postal_code:
             return
@@ -252,9 +322,9 @@ class WalmartAgent:
                 try:
                     el = self.page.locator(sel).first
                     if await el.is_visible(timeout=2000):
-                        await el.click()
+                        await _human_click(self.page, el)
                         clicked = True
-                        await asyncio.sleep(1)
+                        await _delay(0.8, 1.5)
                         break
                 except Exception:
                     pass
@@ -274,61 +344,54 @@ class WalmartAgent:
                 try:
                     el = self.page.locator(sel).first
                     if await el.is_visible(timeout=2000):
-                        await el.fill(self.postal_code)
-                        await asyncio.sleep(0.3)
-                        await el.press("Enter")
-                        await asyncio.sleep(2)
-                        logger.info("Postal code set: %s", self.postal_code)
+                        await _human_type(self.page, el, self.postal_code)
+                        await _short_delay()
+                        await self.page.keyboard.press("Enter")
+                        await _delay(1.5, 2.5)
+                        logger.info("Postal code set", extra={"postal_code": self.postal_code})
                         break
                 except Exception:
                     pass
         except Exception as exc:
-            logger.warning("Could not set postal code: %s", exc)
+            logger.warning("Could not set postal code", extra={"error": str(exc)})
 
     async def _try_add_from_page(self) -> bool:
-        """Attempt to click the first visible 'Add to cart' button on current page."""
         for sel in _ADD_TO_CART:
             btns = self.page.locator(sel)
             if await btns.count() > 0:
                 try:
-                    await btns.first.scroll_into_view_if_needed()
-                    await btns.first.click(timeout=5000)
-                    await asyncio.sleep(1.5)
+                    await _human_click(self.page, btns.first)
+                    await _delay(1.2, 2.5)
                     await self._dismiss()
                     return True
                 except Exception as exc:
-                    logger.debug("Click failed for %s: %s", sel, exc)
+                    logger.debug("Click failed", extra={"selector": sel, "error": str(exc)})
         return False
 
     async def _update_cart_qty(self, qty: int) -> None:
-        """Best-effort: navigate to cart and update qty of last item."""
         try:
             await self.page.goto(
-                f"{WALMART_BASE}/en/cart",
-                wait_until="domcontentloaded",
-                timeout=20000,
+                f"{WALMART_BASE}/en/cart", wait_until="domcontentloaded", timeout=20000
             )
             await asyncio.sleep(1)
-            qty_sels = [
+            for sel in [
                 'input[aria-label*="Quantity"]',
                 'input[aria-label*="quantity"]',
                 'input[name="quantity"]',
                 '[data-automation-id="quantity-input"]',
-            ]
-            for sel in qty_sels:
+            ]:
                 inputs = self.page.locator(sel)
                 n = await inputs.count()
                 if n > 0:
                     last = inputs.nth(n - 1)
-                    current = await last.input_value()
-                    if current != str(qty):
+                    if await last.input_value() != str(qty):
                         await last.triple_click()
                         await last.fill(str(qty))
                         await last.press("Enter")
                         await asyncio.sleep(1)
                     break
         except Exception as exc:
-            logger.debug("Could not update qty: %s", exc)
+            logger.debug("Could not update qty", extra={"qty": qty, "error": str(exc)})
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -339,20 +402,9 @@ class WalmartAgent:
         brand: str | None = None,
         max_price: float | None = None,
     ) -> bool:
-        """
-        Search for an item on walmart.ca and add it to cart.
-
-        If *brand* is provided it is prepended to the search query so Walmart
-        surfaces brand-specific results first (e.g. "indomie chicken noodles").
-
-        *max_price* is stored for future filtering; not yet applied at
-        search-result level (Walmart.ca price filters are JS-heavy).
-
-        Returns True on success.
-        """
-        # Build search query: brand prefix gives better brand-specific results
+        """Single attempt to search and add one item. Returns True on success."""
         query = f"{brand} {name}".strip() if brand else name
-        label = f"{brand} {name}".strip() if brand else name  # for logging
+        label = query
 
         try:
             encoded = query.replace(" ", "+")
@@ -361,92 +413,167 @@ class WalmartAgent:
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
-            await asyncio.sleep(1.5)
+            await _delay(1.5, 3.0)
             await self._check()
 
-            # Try adding directly from search results
+            # Human-like: scroll through results before adding
+            await _random_scroll(self.page)
+
             if await self._try_add_from_page():
-                logger.info("Added '%s' from search results", label)
+                logger.info("Added from search results", extra={"item": label})
                 if qty > 1:
                     await self._update_cart_qty(qty)
                 return True
 
             # Fall back: open first product link
-            product_sels = [
+            for sel in [
                 '[data-automation-id="product-title"] a',
                 'a[data-automation-id="product-link"]',
                 'a[href*="/en/ip/"]',
                 'a[href*="/ip/"]',
-            ]
-            for sel in product_sels:
+            ]:
                 links = self.page.locator(sel)
                 if await links.count() > 0:
                     href = await links.first.get_attribute("href")
                     if href:
-                        product_url = (
-                            href if href.startswith("http") else WALMART_BASE + href
-                        )
+                        product_url = href if href.startswith("http") else WALMART_BASE + href
+                        await _short_delay()
                         await self.page.goto(
-                            product_url,
-                            wait_until="domcontentloaded",
-                            timeout=30000,
+                            product_url, wait_until="domcontentloaded", timeout=30000
                         )
-                        await asyncio.sleep(1.5)
+                        await _delay(1.5, 2.8)
                         await self._check()
+                        await _random_scroll(self.page)
                         if await self._try_add_from_page():
-                            logger.info("Added '%s' from product page", label)
+                            logger.info("Added from product page", extra={"item": label})
                             if qty > 1:
                                 await self._update_cart_qty(qty)
                             return True
                     break
 
-            logger.warning("Could not add '%s' to cart", label)
+            logger.warning("Could not add item", extra={"item": label})
             return False
 
         except BotChallengeError:
             raise
         except Exception as exc:
-            logger.error("Error processing '%s': %s", label, exc, exc_info=True)
+            logger.error("search_and_add error", extra={"item": label, "error": str(exc)})
             return False
 
-    async def build_cart(self, items: list[dict]) -> str:
-        """
-        Full flow: load walmart.ca, set postal code, add all items, return cart URL.
+    async def search_and_add_with_retry(
+        self,
+        name: str,
+        qty: int,
+        brand: str | None = None,
+        max_price: float | None = None,
+        max_attempts: int = 3,   # 1 initial + 2 retries
+    ) -> bool:
+        """Retry wrapper around search_and_add. Never retries BotChallengeError."""
+        label = f"{brand} {name}".strip() if brand else name
 
-        Each item dict must have: name, qty
-        Optional keys:           brand, max_price
-
-        Raises BotChallengeError if Walmart presents a bot challenge.
-        """
-        logger.info("Building cart for %d item(s)", len(items))
-        await self.page.goto(WALMART_BASE, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(1.5)
-        await self._check()
-        await self._set_postal_code()
-
-        ok = 0
-        for item in items:
+        for attempt in range(1, max_attempts + 1):
             try:
-                if await self.search_and_add(
+                ok = await self.search_and_add(name=name, qty=qty, brand=brand, max_price=max_price)
+                if ok:
+                    return True
+                if attempt < max_attempts:
+                    logger.info(
+                        "Item not added, retrying",
+                        extra={"item": label, "attempt": attempt, "max": max_attempts},
+                    )
+                    await _delay(2.0, 4.0)
+            except BotChallengeError:
+                raise   # never retry; propagate immediately
+            except Exception as exc:
+                if attempt < max_attempts:
+                    logger.warning(
+                        "Attempt failed, retrying",
+                        extra={"item": label, "attempt": attempt, "error": str(exc)},
+                    )
+                    await _delay(2.0, 4.0)
+                else:
+                    logger.error(
+                        "All attempts failed",
+                        extra={"item": label, "attempts": max_attempts, "error": str(exc)},
+                    )
+
+        return False
+
+    async def build_cart(self, items: list[dict], job_id: str | None = None) -> dict:
+        """
+        Full flow: navigate to walmart.ca, set postal code, add all items, return cart URL.
+
+        Returns:
+            {
+                "cart_url":  str,
+                "added":     list[str],   # item labels successfully added
+                "failed":    list[str],   # item labels that failed all retries
+                "screenshot": str | None, # path if screenshot was taken
+            }
+
+        Raises BotChallengeError (screenshot taken before raising).
+        """
+        added: list[str] = []
+        failed: list[str] = []
+
+        try:
+            logger.info("Starting cart build", extra={"job_id": job_id, "items": len(items)})
+            # Warm-up: land on homepage first, pause like a human reading it
+            await self.page.goto(WALMART_BASE, wait_until="domcontentloaded", timeout=30000)
+            await _delay(2.0, 4.0)
+            await self._check()
+            # Brief random scroll on homepage before starting searches
+            await _random_scroll(self.page)
+            await self._set_postal_code()
+
+            for item in items:
+                label = (
+                    f"{item['brand']} {item['name']}".strip()
+                    if item.get("brand")
+                    else item["name"]
+                )
+                ok = await self.search_and_add_with_retry(
                     name=item["name"],
                     qty=item.get("qty", 1),
                     brand=item.get("brand"),
                     max_price=item.get("max_price"),
-                ):
-                    ok += 1
-            except BotChallengeError:
-                raise
+                )
+                if ok:
+                    added.append(label)
+                    logger.info("Item added", extra={"job_id": job_id, "item": label})
+                else:
+                    failed.append(label)
+                    logger.warning("Item failed", extra={"job_id": job_id, "item": label})
 
-        logger.info("Added %d/%d items", ok, len(items))
+            logger.info(
+                "Cart build complete",
+                extra={"job_id": job_id, "added": len(added), "failed": len(failed)},
+            )
 
-        await self.page.goto(
-            f"{WALMART_BASE}/en/cart",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        await asyncio.sleep(1.5)
-        await self._check()
-        return self.page.url
+            await self.page.goto(
+                f"{WALMART_BASE}/en/cart", wait_until="domcontentloaded", timeout=30000
+            )
+            await asyncio.sleep(1.5)
+            await self._check()
+
+            # Screenshot when at least one item failed
+            screenshot = None
+            if failed and job_id:
+                screenshot = await self._safe_screenshot(job_id)
+                self.last_screenshot = screenshot
+
+            return {
+                "cart_url":   self.page.url,
+                "added":      added,
+                "failed":     failed,
+                "screenshot": screenshot,
+            }
+
+        except Exception as exc:
+            # Take screenshot before the context manager closes the browser
+            if job_id:
+                self.last_screenshot = await self._safe_screenshot(job_id)
+            raise
 
 
 # ── WalmartLinker ──────────────────────────────────────────────────────────────
@@ -454,9 +581,7 @@ class WalmartAgent:
 class WalmartLinker:
     """
     Headful (visible) browser session used exclusively for the /link command.
-
-    The user manually logs into Walmart.ca; we then save the storage state.
-    No credentials are ever stored.
+    No credentials are stored — the user logs in manually.
 
     Lifecycle:
         linker = WalmartLinker()
@@ -476,8 +601,8 @@ class WalmartLinker:
 
     async def start(self) -> None:
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
-            headless=False,   # must be visible — user interacts with it
+        self._browser = await self._pw.firefox.launch(
+            headless=False,
             args=_STEALTH_ARGS,
         )
         self._context = await self._browser.new_context(
@@ -487,39 +612,29 @@ class WalmartLinker:
             timezone_id="America/Toronto",
             extra_http_headers={"Accept-Language": "en-CA,en;q=0.9"},
         )
-        # Inject stealth script before every page load
         await self._context.add_init_script(_STEALTH_SCRIPT)
         self.page = await self._context.new_page()
 
-        # Go to homepage first (less suspicious than jumping straight to /signin)
         await self.page.goto(WALMART_BASE, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(2)
-
-        # Now navigate to sign-in
         await self.page.goto(
-            f"{WALMART_BASE}/en/signin",
-            wait_until="domcontentloaded",
-            timeout=30000,
+            f"{WALMART_BASE}/en/signin", wait_until="domcontentloaded", timeout=30000
         )
         await asyncio.sleep(1)
 
     async def is_logged_in(self) -> bool:
-        """Return True if the browser's current page looks like an authenticated session."""
         if self.page is None:
             return False
         try:
             url = self.page.url
-            # Still on the sign-in page → not logged in
             if "signin" in url or "login" in url:
                 return False
-            # Check for elements that only appear when authenticated
             for sel in _LOGGED_IN_INDICATORS:
                 try:
                     if await self.page.locator(sel).count() > 0:
                         return True
                 except Exception:
                     pass
-            # If we navigated away from signin, optimistically treat as logged in
             if "walmart.ca" in url:
                 return True
         except Exception:
@@ -527,17 +642,83 @@ class WalmartLinker:
         return False
 
     async def save_session(self, path: str) -> None:
-        """Persist browser storage state (cookies + localStorage) to *path*."""
         dest = Path(path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         await self._context.storage_state(path=str(dest))
-        logger.info("Walmart session saved to %s", path)
+        logger.info("Walmart session saved", extra={"path": path})
 
     async def close(self) -> None:
         if self._browser:
             await self._browser.close()
         if self._pw:
             await self._pw.stop()
+        self._browser = None
+        self._pw = None
+        self.page = None
+
+
+# ── WalmartResumeSession ───────────────────────────────────────────────────────
+
+class WalmartResumeSession:
+    """
+    Headful browser for human-in-the-loop bot challenge resolution.
+
+    Flow:
+        session = WalmartResumeSession(postal_code="M5V3A1")
+        await session.start()          # opens visible browser at walmart.ca
+        # user solves CAPTCHA / verification manually in the browser window
+        await session.save_session()   # persist updated cookies to SESSION_PATH
+        await session.close()          # shut down browser
+        # Re-run WalmartAgent headlessly — it loads the refreshed session file.
+    """
+
+    def __init__(self, postal_code: str = "") -> None:
+        self.postal_code = postal_code
+        self._pw = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
+        self.page: Page | None = None
+
+    async def start(self) -> None:
+        self._pw = await async_playwright().start()
+        self._browser = await self._pw.firefox.launch(
+            headless=False,
+            args=_STEALTH_ARGS,
+        )
+        ctx_kwargs: dict = {
+            "viewport": {"width": 1280, "height": 900},
+            "user_agent": _USER_AGENT,
+            "locale": "en-CA",
+            "timezone_id": "America/Toronto",
+            "extra_http_headers": {"Accept-Language": "en-CA,en-US;q=0.9,en;q=0.8"},
+        }
+        session_file = Path(SESSION_PATH)
+        if session_file.exists():
+            ctx_kwargs["storage_state"] = str(session_file)
+            logger.info("Loaded session for resume", extra={"path": SESSION_PATH})
+
+        self._context = await self._browser.new_context(**ctx_kwargs)
+        await self._context.add_init_script(_STEALTH_SCRIPT)
+        self.page = await self._context.new_page()
+        await self.page.goto(WALMART_BASE, wait_until="domcontentloaded", timeout=30000)
+        logger.info("WalmartResumeSession browser opened")
+
+    async def save_session(self) -> None:
+        if self._context is None:
+            return
+        dest = Path(SESSION_PATH)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await self._context.storage_state(path=str(dest))
+        logger.info("Resume session saved", extra={"path": SESSION_PATH})
+
+    async def close(self) -> None:
+        try:
+            if self._browser:
+                await self._browser.close()
+            if self._pw:
+                await self._pw.stop()
+        except Exception:
+            pass
         self._browser = None
         self._pw = None
         self.page = None
