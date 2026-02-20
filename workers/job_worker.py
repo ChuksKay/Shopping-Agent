@@ -18,7 +18,12 @@ result dict (always present, even on failure):
 """
 
 import asyncio
+import json
 import logging
+import os
+import re
+
+import anthropic
 
 from db.database import get_pending_jobs, get_chat, get_items, update_job
 from agent.walmart import WalmartAgent, BotChallengeError
@@ -28,6 +33,77 @@ logger = logging.getLogger(__name__)
 _callbacks: dict[str, object] = {}
 
 _EMPTY_RESULT: dict = {"cart_url": None, "added": [], "failed": [], "screenshot": None}
+
+
+_ai_client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+
+
+async def _optimize_search_queries(items: list[dict]) -> list[dict]:
+    """
+    Use Claude Haiku to convert stored item names into optimal Walmart.ca Canada
+    search queries. Called once per cart build before the item loop.
+
+    For example:
+        "indomie"          → "Indomie instant noodles"
+        "eggs"             → "eggs large"
+        "bread"            → "bread"
+        "3 packs indomie"  → "Indomie instant noodles"  (qty already extracted)
+    """
+    if not items:
+        return items
+
+    entries = []
+    for item in items:
+        label = f"{item['brand']} {item['name']}".strip() if item.get("brand") else item["name"]
+        entries.append(label)
+
+    prompt = (
+        "You are helping build a Walmart.ca Canada grocery cart. "
+        "Convert these item names into the best possible Walmart.ca search queries.\n"
+        "Return ONLY a JSON array of search query strings in the same order. No explanation.\n\n"
+        "Items: " + json.dumps(entries) + "\n\n"
+        "Rules:\n"
+        "- Use standard grocery product names Walmart Canada would carry\n"
+        "- Include brand if provided (e.g. 'Indomie instant noodles')\n"
+        "- Keep queries concise: 2-5 words max\n"
+        "- Strip any leftover quantity words (e.g. '3 packs of', 'a dozen')\n"
+        "- Examples: 'indomie' → 'Indomie instant noodles', "
+        "'eggs' → 'large eggs', 'bread' → 'bread', "
+        "'rice' → 'long grain white rice', 'chicken' → 'chicken breast'\n"
+        "- If already a good query, keep as-is\n"
+        "Output:"
+    )
+
+    try:
+        resp = await _ai_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.content[0].text.strip()
+        text = re.sub(r"^```[a-z]*\n?", "", text).rstrip("`").strip()
+        queries = json.loads(text)
+
+        result = []
+        for i, item in enumerate(items):
+            if i < len(queries) and isinstance(queries[i], str) and queries[i].strip():
+                optimized_query = queries[i].strip()
+                new_item = dict(item)
+                # Store optimized query in name; clear brand so it isn't double-prepended
+                new_item["name"] = optimized_query
+                new_item["brand"] = None
+                result.append(new_item)
+            else:
+                result.append(item)
+
+        logger.info("Search queries optimized", extra={"count": len(result),
+                    "queries": [r["name"] for r in result]})
+        return result
+
+    except Exception as exc:
+        logger.warning("Search query optimization failed, using originals",
+                       extra={"error": str(exc)})
+        return items
 
 
 def register_callback(job_id: str, cb) -> None:
@@ -59,6 +135,9 @@ async def process_job(job: dict) -> None:
         }
         for row in item_rows
     ]
+
+    # Translate item names into optimal Walmart.ca search queries
+    items = await _optimize_search_queries(items)
 
     async with WalmartAgent(postal_code=postal_code) as agent:
         try:

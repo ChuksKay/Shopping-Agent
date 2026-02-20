@@ -6,8 +6,10 @@ so the user can chat naturally instead of memorising commands.
 """
 
 import asyncio
+import json
 import logging
 import os
+import re
 import uuid
 
 import anthropic
@@ -31,19 +33,26 @@ _histories: dict[int, list] = {}
 _MAX_HISTORY = 20
 
 _SYSTEM = """\
-You are a friendly, casual shopping assistant for Walmart.ca. \
-You help the user manage their grocery list and build their cart. \
-Think of yourself as a smart friend who handles their grocery runs.
+You are a grocery shopping assistant for Walmart.ca Canada. \
+Your job is to manage the user's grocery list and build their cart.
 
-Rules:
-- Keep replies SHORT — 1 to 3 sentences unless you're listing items.
-- When the user mentions items to buy, call add_to_list right away.
-- When they say things like "go", "shop", "build my cart", "checkout", "order now", call build_cart.
-- When they say "clear", "reset", "new list", or "start over", call clear_list.
-- If they mention a postal code or location, call set_location.
-- Never invent items, prices, or availability.
-- If something is ambiguous, ask ONE short question.
-- You can use emojis sparingly to be friendly.
+STRICT RULES — follow every one of these exactly:
+1. ONLY add items the user EXPLICITLY names. NEVER add items they didn't mention, \
+   even if they seem related or complementary. If the user says "milk", add only milk — \
+   not butter, not cream.
+2. If the user's message is vague or unclear, ask ONE short clarifying question \
+   before calling add_to_list.
+3. Pass quantities exactly as the user stated them — do NOT convert: \
+   "3 packs of indomie", "a dozen eggs", "2 bags of rice". \
+   The system will handle conversion.
+4. Trigger build_cart when the user says: "go", "shop", "build cart", "order", \
+   "checkout", "run it", "do it", "start shopping".
+5. Trigger clear_list when the user says: "clear", "reset", "start over", "new list", \
+   "remove everything".
+6. Trigger set_location when the user mentions a postal code or city.
+7. Keep replies SHORT — 1 to 3 sentences max.
+8. Never invent prices, availability, or product details.
+9. Do NOT suggest adding extra items unless the user explicitly asks for recommendations.
 """
 
 _TOOLS = [
@@ -105,6 +114,71 @@ _TOOLS = [
         },
     },
 ]
+
+
+async def _ai_parse_items(raw_items: list[str]) -> list[dict]:
+    """
+    Use Claude Haiku to parse raw item strings into structured dicts.
+
+    Handles natural language quantities ("a dozen", "3 packs of", "half a dozen")
+    that the regex parser cannot. Falls back to regex on any failure.
+    """
+    if not raw_items:
+        return []
+
+    prompt = (
+        "Parse these grocery shopping items into structured data.\n"
+        "Return ONLY a JSON array — no explanation, no markdown.\n\n"
+        "Items to parse: " + json.dumps(raw_items) + "\n\n"
+        "For each item, output an object with:\n"
+        '  "name": concise product name good for searching on Walmart.ca (string)\n'
+        '  "qty": integer quantity — convert language: '
+        '"a dozen"=12, "half dozen"=6, "a"=1, "a pack"=1, "a bag"=1, '
+        '"a couple"=2, "a few"=3; default=1\n'
+        '  "brand": brand name if explicitly stated, otherwise null\n'
+        '  "max_price": numeric price cap if stated (e.g. "max $5" → 5.0), otherwise null\n\n'
+        "IMPORTANT: Only include items that appear in the input. Do not add extras.\n"
+        "Example input: [\"3 packs indomie chicken\", \"a dozen eggs\", \"2L milk max $5\"]\n"
+        'Example output: [{"name":"indomie chicken noodles","qty":3,"brand":"Indomie","max_price":null},'
+        '{"name":"eggs","qty":12,"brand":null,"max_price":null},'
+        '{"name":"milk 2L","qty":1,"brand":null,"max_price":5.0}]\n\n'
+        "Now parse:"
+    )
+
+    try:
+        resp = await _client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.content[0].text.strip()
+        # Strip markdown code fences if present
+        text = re.sub(r"^```[a-z]*\n?", "", text).rstrip("`").strip()
+        parsed = json.loads(text)
+
+        result = []
+        for item in parsed:
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            brand = item.get("brand") or None
+            max_p = item.get("max_price")
+            result.append({
+                "name":      name,
+                "qty":       max(1, int(float(item.get("qty", 1)))),
+                "brand":     brand,
+                "max_price": float(max_p) if max_p is not None else None,
+                "text":      name,
+            })
+        return result
+
+    except Exception as exc:
+        logger.warning("AI item parse failed, falling back to regex",
+                       extra={"error": str(exc)})
+        result = []
+        for raw in raw_items:
+            result.extend(parse_items(raw))
+        return result
 
 
 async def handle_message(
@@ -198,9 +272,8 @@ async def _run_tool(
 
         elif name == "add_to_list":
             raw_items = inputs.get("items", [])
-            parsed = []
-            for raw in raw_items:
-                parsed.extend(parse_items(raw))
+            # Use AI parser — understands "3 packs of X", "a dozen", etc.
+            parsed = await _ai_parse_items(raw_items)
             if not parsed:
                 return "Couldn't parse any items from the input."
             if not await get_chat(chat_id):
