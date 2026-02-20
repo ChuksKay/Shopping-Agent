@@ -7,11 +7,13 @@ Classes:
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
 from pathlib import Path
 
+import anthropic
 from playwright.async_api import (
     async_playwright,
     Browser,
@@ -21,6 +23,8 @@ from playwright.async_api import (
 )
 
 logger = logging.getLogger(__name__)
+
+_ai_client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
 
 SESSION_PATH: str = os.getenv("SESSION_PATH", "sessions/walmart_session.json")
 HEADLESS: bool = os.getenv("HEADLESS", "true").lower() == "true"
@@ -226,6 +230,175 @@ async def _dismiss_overlays(page: Page) -> None:
             pass
 
 
+# ── Product selection helpers ──────────────────────────────────────────────────
+
+async def _extract_search_results(page: Page) -> list[dict]:
+    """
+    Extract product info from a Walmart.ca search results page.
+
+    Tries __NEXT_DATA__ JSON first (fastest, most complete), then falls
+    back to DOM scraping.  Returns up to 12 products with:
+        title, brand, price (float|None), badges (list[str]), url, sponsored (bool)
+    """
+    # ── 1. __NEXT_DATA__ (Next.js SSR payload) ─────────────────────────────────
+    try:
+        products = await page.evaluate("""
+            () => {
+                try {
+                    const el = document.getElementById('__NEXT_DATA__');
+                    if (!el) return null;
+                    const data = JSON.parse(el.textContent);
+                    // Common paths for Walmart.ca search result items
+                    const stacks =
+                        data?.props?.pageProps?.initialData?.searchResult?.itemStacks ||
+                        data?.props?.pageProps?.initialData?.contentLayout?.modules;
+                    if (!stacks || !stacks.length) return null;
+                    const out = [];
+                    for (const stack of stacks) {
+                        const items = stack.items || stack.products || [];
+                        for (const raw of items) {
+                            const p = raw.item || raw;
+                            if (!p || !p.name) continue;
+                            const price =
+                                p.priceInfo?.currentPrice?.price ??
+                                p.salePrice ?? p.price ?? null;
+                            const badges = [];
+                            for (const f of (p.badges?.flags || [])) {
+                                if (f.text) badges.push(f.text);
+                            }
+                            out.push({
+                                title:     p.name,
+                                brand:     p.brand || '',
+                                price:     typeof price === 'number' ? price : null,
+                                badges:    badges,
+                                url:       p.canonicalUrl || '',
+                                sponsored: !!(p.sponsoredProduct || p.isAd),
+                            });
+                            if (out.length >= 12) break;
+                        }
+                        if (out.length >= 12) break;
+                    }
+                    return out.length ? out : null;
+                } catch(e) { return null; }
+            }
+        """)
+        if products and len(products) > 0:
+            return products
+    except Exception:
+        pass
+
+    # ── 2. DOM fallback ────────────────────────────────────────────────────────
+    try:
+        products = await page.evaluate("""
+            () => {
+                const cards = Array.from(document.querySelectorAll(
+                    '[data-item-id], [data-testid="list-view"], [class*="product-tile"]'
+                )).slice(0, 12);
+                return cards.map((card) => {
+                    const titleEl =
+                        card.querySelector('[data-automation-id="product-title"]') ||
+                        card.querySelector('[class*="product-title"]');
+                    const priceEl =
+                        card.querySelector('[itemprop="price"]') ||
+                        card.querySelector('[data-automation-id*="price"]') ||
+                        card.querySelector('[class*="price-main"]');
+                    const badgeEl =
+                        card.querySelector('[data-automation-id*="badge"]') ||
+                        card.querySelector('[class*="badge"]') ||
+                        card.querySelector('[class*="flag"]');
+                    const link = card.querySelector('a[href*="/en/ip/"], a[href*="/ip/"]');
+                    const rawPrice = priceEl?.getAttribute('content') || priceEl?.innerText || '';
+                    const numPrice = parseFloat(rawPrice.replace(/[^0-9.]/g, '')) || null;
+                    return {
+                        title:     titleEl?.innerText?.trim() || '',
+                        brand:     '',
+                        price:     numPrice,
+                        badges:    badgeEl ? [badgeEl.innerText.trim()] : [],
+                        url:       link?.href || '',
+                        sponsored: false,
+                    };
+                }).filter(p => p.title && p.url);
+            }
+        """)
+        if products and len(products) > 0:
+            return products
+    except Exception:
+        pass
+
+    return []
+
+
+async def _ai_select_product(
+    products: list[dict],
+    item_name: str,
+    brand: str | None,
+    max_price: float | None,
+) -> int | None:
+    """
+    Use Claude Haiku to pick the best product index from search results.
+
+    Selection priority:
+        1. Brand match (if brand specified)
+        2. Price ≤ max_price (if specified)
+        3. Best seller / popular badge
+        4. Lowest price among qualifying products
+
+    Returns 0-based index, or None if nothing qualifies.
+    """
+    if not products:
+        return None
+
+    constraints = []
+    if brand:
+        constraints.append(f'Brand must match: "{brand}"')
+    if max_price is not None:
+        constraints.append(f"Price must be ≤ ${max_price:.2f}")
+    if not constraints:
+        constraints.append("Pick the most affordable OR best-seller product")
+
+    display = [
+        {
+            "index":     i,
+            "title":     p.get("title", "")[:80],
+            "brand":     p.get("brand", ""),
+            "price":     p.get("price"),
+            "badges":    p.get("badges", []),
+            "sponsored": p.get("sponsored", False),
+        }
+        for i, p in enumerate(products)
+    ]
+
+    prompt = (
+        f'Walmart.ca Canada search results for: "{item_name}"\n'
+        f'Requirements: {"; ".join(constraints)}\n\n'
+        f'Products:\n{json.dumps(display, indent=2)}\n\n'
+        'Rules:\n'
+        '1. If brand is required, only consider products whose title or brand field '
+        'contains that brand name\n'
+        '2. Exclude any product priced above the max price\n'
+        '3. Among qualifying products prefer: '
+        'best seller badge > popular badge > lowest price\n'
+        '4. Avoid sponsored products unless they are the only option\n'
+        '5. Reply with ONLY the integer index of the best product, '
+        'or -1 if no product qualifies\n'
+        '\nAnswer:'
+    )
+
+    try:
+        resp = await _ai_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=8,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        idx = int(resp.content[0].text.strip().split()[0])
+        if 0 <= idx < len(products):
+            return idx
+    except Exception as exc:
+        logger.warning("AI product selection failed", extra={"error": str(exc)})
+
+    return None
+
+
 # ── WalmartAgent ───────────────────────────────────────────────────────────────
 
 class WalmartAgent:
@@ -402,7 +575,10 @@ class WalmartAgent:
         brand: str | None = None,
         max_price: float | None = None,
     ) -> bool:
-        """Single attempt to search and add one item. Returns True on success."""
+        """
+        Search Walmart.ca, use AI to select the best matching product
+        (respecting brand and price constraints), then add it to cart.
+        """
         query = f"{brand} {name}".strip() if brand else name
         label = query
 
@@ -415,17 +591,50 @@ class WalmartAgent:
             )
             await _delay(1.5, 3.0)
             await self._check()
-
-            # Human-like: scroll through results before adding
             await _random_scroll(self.page)
 
+            # ── AI-powered product selection ───────────────────────────────────
+            products = await _extract_search_results(self.page)
+            if products:
+                selected_idx = await _ai_select_product(products, name, brand, max_price)
+                if selected_idx is not None:
+                    product = products[selected_idx]
+                    product_url = product.get("url", "")
+                    if product_url and not product_url.startswith("http"):
+                        product_url = WALMART_BASE + product_url
+
+                    logger.info(
+                        "AI selected product",
+                        extra={
+                            "item":    label,
+                            "chosen":  product.get("title", "")[:60],
+                            "price":   product.get("price"),
+                            "badges":  product.get("badges", []),
+                        },
+                    )
+
+                    if product_url:
+                        await _short_delay()
+                        await self.page.goto(
+                            product_url, wait_until="domcontentloaded", timeout=30000
+                        )
+                        await _delay(1.5, 2.8)
+                        await self._check()
+                        await _random_scroll(self.page)
+                        if await self._try_add_from_page():
+                            logger.info("Added AI-selected product", extra={"item": label})
+                            if qty > 1:
+                                await self._update_cart_qty(qty)
+                            return True
+
+            # ── Fallback 1: add-to-cart button visible on search results ───────
             if await self._try_add_from_page():
-                logger.info("Added from search results", extra={"item": label})
+                logger.info("Added from search results (fallback)", extra={"item": label})
                 if qty > 1:
                     await self._update_cart_qty(qty)
                 return True
 
-            # Fall back: open first product link
+            # ── Fallback 2: open first product link ────────────────────────────
             for sel in [
                 '[data-automation-id="product-title"] a',
                 'a[data-automation-id="product-link"]',
@@ -445,7 +654,7 @@ class WalmartAgent:
                         await self._check()
                         await _random_scroll(self.page)
                         if await self._try_add_from_page():
-                            logger.info("Added from product page", extra={"item": label})
+                            logger.info("Added from product page (fallback)", extra={"item": label})
                             if qty > 1:
                                 await self._update_cart_qty(qty)
                             return True
