@@ -31,6 +31,38 @@ HEADLESS: bool = os.getenv("HEADLESS", "true").lower() == "true"
 WALMART_BASE = "https://www.walmart.ca"
 SCREENSHOT_DIR = Path("storage/screenshots")
 
+# Akamai / PerimeterX cookies that track visitor identity and get flagged.
+# Stripping them before each headless run lets Akamai see a fresh visitor
+# while keeping the Walmart auth cookies intact.
+_TRACKING_COOKIES = {
+    "_abck", "ak_bmsc", "bm_sv", "bm_sz",   # Akamai Bot Manager
+    "pxcts", "_pxvid", "__pxvid",            # PerimeterX
+    "akavpau_p1", "akavpau_p2",             # Akamai edge tokens
+    "rxvt", "rxVisitor",                     # Rx visitor tracking
+}
+
+
+def _clean_session(path: str) -> dict:
+    """
+    Load a saved Playwright storage_state JSON and strip Akamai/PerimeterX
+    tracking cookies so each headless run starts with a fresh bot-detection
+    identity while preserving Walmart auth cookies.
+    """
+    import json as _json
+    data = _json.loads(Path(path).read_text())
+    before = len(data.get("cookies", []))
+    data["cookies"] = [
+        c for c in data.get("cookies", [])
+        if c.get("name") not in _TRACKING_COOKIES
+    ]
+    after = len(data["cookies"])
+    if before != after:
+        logger.info(
+            "Stripped tracking cookies from session",
+            extra={"removed": before - after, "kept": after},
+        )
+    return data
+
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) "
     "Gecko/20100101 Firefox/133.0"
@@ -445,8 +477,11 @@ class WalmartAgent:
         }
         session = Path(SESSION_PATH)
         if session.exists():
-            ctx_kwargs["storage_state"] = str(session)
-            logger.info("Loaded Walmart session", extra={"session": SESSION_PATH})
+            # Load session with Akamai/PerimeterX tracking cookies stripped
+            # so each run starts with a fresh bot-detection identity.
+            ctx_kwargs["storage_state"] = _clean_session(SESSION_PATH)
+            logger.info("Loaded Walmart session (tracking cookies stripped)",
+                        extra={"session": SESSION_PATH})
 
         self._context = await self._browser.new_context(**ctx_kwargs)
         await self._context.add_init_script(_STEALTH_SCRIPT)
@@ -941,8 +976,9 @@ class WalmartResumeSession:
         }
         session_file = Path(SESSION_PATH)
         if session_file.exists():
-            ctx_kwargs["storage_state"] = str(session_file)
-            logger.info("Loaded session for resume", extra={"path": SESSION_PATH})
+            ctx_kwargs["storage_state"] = _clean_session(SESSION_PATH)
+            logger.info("Loaded session for resume (tracking cookies stripped)",
+                        extra={"path": SESSION_PATH})
 
         self._context = await self._browser.new_context(**ctx_kwargs)
         await self._context.add_init_script(_STEALTH_SCRIPT)
