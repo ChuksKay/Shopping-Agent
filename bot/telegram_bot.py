@@ -61,10 +61,17 @@ _resume_sessions: dict[str, WalmartResumeSession] = {}
 # ── Inline keyboard helpers ────────────────────────────────────────────────────
 
 def _challenge_keyboard(job_id: str) -> InlineKeyboardMarkup:
-    """Two-button keyboard shown when Walmart triggers a bot challenge."""
+    """
+    Keyboard shown when Walmart triggers a bot challenge.
+
+    User flow:
+      1. Tap 'Open Walmart' → walmart.ca opens in phone browser
+      2. Browse / verify login on phone
+      3. Tap 'Retry' → bot tries the cart build again
+    """
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔓 Open Browser to Solve", callback_data=f"resume:{job_id}")],
-        [InlineKeyboardButton("✅ Done — Resume Cart Build", callback_data=f"continue:{job_id}")],
+        [InlineKeyboardButton("🌐 Open Walmart.ca", url="https://www.walmart.ca")],
+        [InlineKeyboardButton("🔄 Retry Cart Build", callback_data=f"retry:{job_id}")],
     ])
 
 
@@ -312,9 +319,9 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_message(
                 chat_id=cid,
                 text=(
-                    "Walmart needs a quick verification check 🤖\n"
-                    "Tap *Open Browser* to solve it on your Mac, "
-                    "then tap *Done* when finished."
+                    "Walmart blocked the bot 🤖\n"
+                    "Open Walmart on your phone, make sure you're logged in, "
+                    "then tap *Retry*."
                 ),
                 parse_mode="Markdown",
                 reply_markup=_challenge_keyboard(job_id),
@@ -482,8 +489,9 @@ async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await context.bot.send_message(
                 chat_id=cid,
                 text=(
-                    "Walmart needs another verification check 🤖\n"
-                    "Tap *Open Browser* to try again."
+                    "Walmart blocked the bot again 🤖\n"
+                    "Open Walmart on your phone, make sure you're logged in, "
+                    "then tap *Retry*."
                 ),
                 parse_mode="Markdown",
                 reply_markup=_challenge_keyboard(job_id),
@@ -654,8 +662,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     Handles taps on the inline keyboard sent with bot-challenge messages.
 
     callback_data format:
-        "resume:<job_id>"   — open headful browser so user can solve CAPTCHA
-        "continue:<job_id>" — verification done; save session and re-run job
+        "retry:<job_id>" — reset job to pending and re-run the cart build
     """
     query = update.callback_query
     await query.answer()
@@ -667,80 +674,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     action, job_id = data.split(":", 1)
     chat_id = update.effective_chat.id
 
-    # ── "Open Browser" tapped ──────────────────────────────────────────────────
-    if action == "resume":
+    # ── "Retry" tapped ─────────────────────────────────────────────────────────
+    if action == "retry":
         job = await get_job(job_id)
         if not job:
-            await query.edit_message_text(f"Job {job_id} not found.")
-            return
-        if job["status"] != "needs_user":
-            await query.edit_message_text(
-                f"Job is already `{job['status']}` — nothing to resume.",
-                parse_mode="Markdown",
-            )
+            await query.edit_message_text(f"Job `{job_id}` not found.", parse_mode="Markdown")
             return
 
-        # Update message: remove "Open Browser" button while browser opens,
-        # keep "Done" button so user can tap it when finished.
-        await query.edit_message_text(
-            "Browser opened on your Mac 🖥️\n"
-            "Complete the Walmart verification check, then tap *Done* below.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "✅ Done — Resume Cart Build",
-                    callback_data=f"continue:{job_id}",
-                )
-            ]]),
-        )
-
-        await _close_resume_session(job_id)
-        chat = await get_chat(job["chat_id"])
-        postal_code = chat["postal_code"] if chat else ""
-        session = WalmartResumeSession(postal_code=postal_code)
-        _resume_sessions[job_id] = session
-        try:
-            await session.start()
-        except Exception as exc:
-            _resume_sessions.pop(job_id, None)
-            logger.error("Failed to open resume browser", extra={"job_id": job_id, "error": str(exc)})
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"Couldn't open browser: {exc}",
-            )
-
-    # ── "Done" tapped ─────────────────────────────────────────────────────────
-    elif action == "continue":
-        session = _resume_sessions.pop(job_id, None)
-        if session is None:
-            # Might have already been closed or never opened
-            await query.edit_message_text(
-                "No active browser session found.\nTap *Open Browser* first.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "🔓 Open Browser to Solve",
-                        callback_data=f"resume:{job_id}",
-                    )
-                ]]),
-            )
-            return
-
-        await query.edit_message_text("Saving verification and resuming cart build... 🛒")
-
-        try:
-            await session.save_session()
-            await session.close()
-        except Exception as exc:
-            logger.warning("Error closing resume session",
-                           extra={"job_id": job_id, "error": str(exc)})
-
-        job = await get_job(job_id)
-        if not job:
-            await context.bot.send_message(chat_id=chat_id, text=f"Job {job_id} not found.")
-            return
-
-        job_chat_id = job["chat_id"]
+        await query.edit_message_text("Retrying cart build... 🛒")
         await update_job(job_id, "pending", error=None, screenshot=None)
 
         async def on_done(
@@ -777,8 +718,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await context.bot.send_message(
                     chat_id=cid,
                     text=(
-                        "Walmart needs another verification check 🤖\n"
-                        "Tap *Open Browser* to try again."
+                        "Walmart blocked the bot again 🤖\n"
+                        "Open Walmart on your phone, make sure you're logged in, "
+                        "then tap *Retry*."
                     ),
                     parse_mode="Markdown",
                     reply_markup=_challenge_keyboard(job_id),
