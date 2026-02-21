@@ -136,40 +136,71 @@ async def process_job(job: dict) -> None:
         for row in item_rows
     ]
 
-    # Translate item names into optimal Walmart.ca search queries
-    items = await _optimize_search_queries(items)
+    # Try up to 2 attempts:
+    #   Attempt 1 — normal headless run
+    #   Attempt 2 — after silent headful session refresh (if attempt 1 was blocked)
+    for attempt in range(1, 3):
+        items_run = await _optimize_search_queries(items)
 
-    async with WalmartAgent(postal_code=postal_code) as agent:
-        try:
-            result = await agent.build_cart(items, job_id=job_id)
+        async with WalmartAgent(postal_code=postal_code) as agent:
+            try:
+                result = await agent.build_cart(items_run, job_id=job_id)
 
-            await update_job(job_id, "done", result_url=result["cart_url"])
-            logger.info(
-                "Job done",
-                extra={
-                    "job_id":  job_id,
-                    "added":   len(result["added"]),
-                    "failed":  len(result["failed"]),
-                    "cart_url": result["cart_url"],
-                },
-            )
-            await _fire(job_id, chat_id, result["cart_url"], "done", result=result)
+                await update_job(job_id, "done", result_url=result["cart_url"])
+                logger.info(
+                    "Job done",
+                    extra={
+                        "job_id":   job_id,
+                        "attempt":  attempt,
+                        "added":    len(result["added"]),
+                        "failed":   len(result["failed"]),
+                        "cart_url": result["cart_url"],
+                    },
+                )
+                await _fire(job_id, chat_id, result["cart_url"], "done", result=result)
+                return  # success — stop here
 
-        except BotChallengeError as exc:
-            screenshot = agent.last_screenshot
-            msg = "Walmart needs verification"
-            logger.warning("Bot challenge", extra={"job_id": job_id, "error": str(exc)})
-            await update_job(job_id, "needs_user", error=msg, screenshot=screenshot)
-            result = {**_EMPTY_RESULT, "screenshot": screenshot}
-            await _fire(job_id, chat_id, None, "needs_user", msg, result)
+            except BotChallengeError as exc:
+                screenshot = agent.last_screenshot
+                logger.warning(
+                    "Bot challenge on attempt %d/%d",
+                    attempt, 2,
+                    extra={"job_id": job_id, "error": str(exc)},
+                )
 
-        except Exception as exc:
-            screenshot = agent.last_screenshot
-            msg = str(exc)
-            logger.error("Job failed", extra={"job_id": job_id, "error": msg}, exc_info=True)
-            await update_job(job_id, "failed", error=msg, screenshot=screenshot)
-            result = {**_EMPTY_RESULT, "screenshot": screenshot}
-            await _fire(job_id, chat_id, None, "failed", msg, result)
+                if attempt == 1:
+                    # First block — silently open headful Firefox to get fresh
+                    # Akamai cookies, then loop and retry headlessly.
+                    logger.info(
+                        "Auto-refreshing session with headful Firefox...",
+                        extra={"job_id": job_id},
+                    )
+                    from agent.walmart import refresh_session_headful
+                    refreshed = await refresh_session_headful()
+                    if refreshed:
+                        logger.info(
+                            "Session refreshed — retrying cart build",
+                            extra={"job_id": job_id},
+                        )
+                        continue  # go to attempt 2
+
+                # Attempt 2 also blocked, or headful refresh itself failed
+                msg = "Walmart needs verification"
+                await update_job(job_id, "needs_user", error=msg, screenshot=screenshot)
+                result_data = {**_EMPTY_RESULT, "screenshot": screenshot}
+                await _fire(job_id, chat_id, None, "needs_user", msg, result_data)
+                return
+
+            except Exception as exc:
+                screenshot = agent.last_screenshot
+                msg = str(exc)
+                logger.error(
+                    "Job failed", extra={"job_id": job_id, "error": msg}, exc_info=True
+                )
+                await update_job(job_id, "failed", error=msg, screenshot=screenshot)
+                result_data = {**_EMPTY_RESULT, "screenshot": screenshot}
+                await _fire(job_id, chat_id, None, "failed", msg, result_data)
+                return
 
 
 async def _fire(

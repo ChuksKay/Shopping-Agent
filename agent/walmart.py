@@ -820,6 +820,80 @@ class WalmartAgent:
             raise
 
 
+# ── Headful session refresh ────────────────────────────────────────────────────
+
+async def refresh_session_headful(session_path: str = SESSION_PATH) -> bool:
+    """
+    Open a VISIBLE (headful) Firefox browser to obtain fresh Akamai-accepted
+    cookies, then save the updated session to disk.
+
+    Why this works:
+        Headless Firefox has subtle fingerprint differences (canvas, WebGL,
+        timing) that Akamai's JS probes detect.  A headful browser has a
+        genuine fingerprint and passes the JS challenge automatically within
+        a few seconds — no user interaction needed.
+
+    Called automatically by the job worker on the first BotChallengeError
+    before escalating to the user.
+
+    Returns True if the session was refreshed and the site is accessible.
+    """
+    pw = None
+    browser = None
+    try:
+        pw = await async_playwright().start()
+        browser = await pw.firefox.launch(headless=False, args=_STEALTH_ARGS)
+
+        ctx_kwargs: dict = {
+            "viewport":   {"width": 1280, "height": 900},
+            "user_agent": _USER_AGENT,
+            "locale":     "en-CA",
+            "timezone_id": "America/Toronto",
+            "extra_http_headers": {"Accept-Language": "en-CA,en-US;q=0.9,en;q=0.8"},
+        }
+        # Keep Walmart auth cookies but strip all Akamai/PerimeterX trackers
+        session_file = Path(session_path)
+        if session_file.exists():
+            ctx_kwargs["storage_state"] = _clean_session(session_path)
+
+        context = await browser.new_context(**ctx_kwargs)
+        await context.add_init_script(_STEALTH_SCRIPT)
+        page = await context.new_page()
+
+        # Load the homepage — headful Firefox auto-passes Akamai's JS challenge
+        await page.goto(WALMART_BASE, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(7)   # let Akamai scripts run and issue fresh cookies
+
+        # Navigate deeper to finalise the session
+        await page.goto(f"{WALMART_BASE}/en", wait_until="domcontentloaded", timeout=20000)
+        await asyncio.sleep(4)
+
+        # Confirm we're not blocked
+        url = page.url
+        if any(x in url for x in ("blocked", "captcha", "denied")):
+            logger.warning("Headful refresh still blocked", extra={"url": url})
+            return False
+
+        # Persist the fresh session (keeps auth + new Akamai cookies)
+        dest = Path(session_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await context.storage_state(path=str(dest))
+        logger.info("Headful session refresh succeeded", extra={"path": session_path})
+        return True
+
+    except Exception as exc:
+        logger.error("Headful session refresh failed", extra={"error": str(exc)})
+        return False
+    finally:
+        try:
+            if browser:
+                await browser.close()
+            if pw:
+                await pw.stop()
+        except Exception:
+            pass
+
+
 # ── WalmartLinker ──────────────────────────────────────────────────────────────
 
 class WalmartLinker:

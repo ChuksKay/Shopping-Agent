@@ -319,9 +319,9 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_message(
                 chat_id=cid,
                 text=(
-                    "Walmart blocked the bot 🤖\n"
-                    "Open Walmart on your phone, make sure you're logged in, "
-                    "then tap *Retry*."
+                    "Walmart is blocking the bot 🤖\n"
+                    "The bot tried to auto-fix it but couldn't get through. "
+                    "Try again in a few minutes — tap *Retry* below."
                 ),
                 parse_mode="Markdown",
                 reply_markup=_challenge_keyboard(job_id),
@@ -489,9 +489,8 @@ async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await context.bot.send_message(
                 chat_id=cid,
                 text=(
-                    "Walmart blocked the bot again 🤖\n"
-                    "Open Walmart on your phone, make sure you're logged in, "
-                    "then tap *Retry*."
+                    "Walmart is still blocking the bot 🤖\n"
+                    "Wait a few minutes and tap *Retry*, or use /link to refresh your session."
                 ),
                 parse_mode="Markdown",
                 reply_markup=_challenge_keyboard(job_id),
