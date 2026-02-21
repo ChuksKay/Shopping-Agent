@@ -19,6 +19,7 @@ Commands:
 import asyncio
 import logging
 import os
+import socket
 import uuid
 from pathlib import Path
 
@@ -45,6 +46,7 @@ from db.database import (
     update_job,
     upsert_chat,
 )
+from agent.walmart import merge_phone_cookies
 from workers.job_worker import process_job, register_callback, schedule_job
 
 logger = logging.getLogger(__name__)
@@ -58,19 +60,40 @@ _link_sessions: dict[int, WalmartLinker] = {}
 # In-memory map of job_id → active WalmartResumeSession (for /resume flow)
 _resume_sessions: dict[str, WalmartResumeSession] = {}
 
+# Track which job_id is awaiting phone-solve for each chat, so the uploaded
+# cookie file knows which job to retry.
+_phone_solve_jobs: dict[int, str] = {}   # chat_id → job_id
+
 # ── Inline keyboard helpers ────────────────────────────────────────────────────
+
+def _get_phone_solve_base() -> str:
+    """Return base URL for the phone-solve page (env override or local IP)."""
+    override = os.getenv("PHONE_SOLVE_URL", "").strip().rstrip("/")
+    if override:
+        return override
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return f"http://{ip}:8000"
+    except Exception:
+        return "http://localhost:8000"
+
 
 def _challenge_keyboard(job_id: str) -> InlineKeyboardMarkup:
     """
     Keyboard shown when Walmart triggers a bot challenge.
 
     User flow:
-      1. Tap 'Open Walmart' → walmart.ca opens in phone browser
-      2. Browse / verify login on phone
-      3. Tap 'Retry' → bot tries the cart build again
+      1. Tap 'Solve from Phone' → opens the step-by-step phone-solve page
+      2. Follow steps: visit Walmart, run JS snippet, download cookie file, send to bot
+         — OR —
+      3. Tap 'Retry' to just try again (after waiting a few minutes)
     """
+    solve_url = f"{_get_phone_solve_base()}/phone-solve/{job_id}"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 Open Walmart.ca", url="https://www.walmart.ca")],
+        [InlineKeyboardButton("📱 Solve from Phone", url=solve_url)],
         [InlineKeyboardButton("🔄 Retry Cart Build", callback_data=f"retry:{job_id}")],
     ])
 
@@ -316,12 +339,13 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 parse_mode="Markdown",
             )
         elif status == "needs_user":
+            _phone_solve_jobs[cid] = job_id
             await context.bot.send_message(
                 chat_id=cid,
                 text=(
-                    "Walmart is blocking the bot 🤖\n"
-                    "The bot tried to auto-fix it but couldn't get through. "
-                    "Try again in a few minutes — tap *Retry* below."
+                    "Walmart is blocking the bot 🤖\n\n"
+                    "Tap *Solve from Phone* for step-by-step instructions to fix it from your phone.\n\n"
+                    "Or tap *Retry* to try again in a few minutes."
                 ),
                 parse_mode="Markdown",
                 reply_markup=_challenge_keyboard(job_id),
@@ -486,11 +510,13 @@ async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 parse_mode="Markdown",
             )
         elif status == "needs_user":
+            _phone_solve_jobs[cid] = job_id
             await context.bot.send_message(
                 chat_id=cid,
                 text=(
-                    "Walmart is still blocking the bot 🤖\n"
-                    "Wait a few minutes and tap *Retry*, or use /link to refresh your session."
+                    "Walmart is still blocking the bot 🤖\n\n"
+                    "Tap *Solve from Phone* for step-by-step instructions to fix it from your phone.\n\n"
+                    "Or wait a few minutes and tap *Retry*."
                 ),
                 parse_mode="Markdown",
                 reply_markup=_challenge_keyboard(job_id),
@@ -629,12 +655,13 @@ async def ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     parse_mode="Markdown",
                 )
             elif status == "needs_user":
+                _phone_solve_jobs[cid] = job_id
                 await context.bot.send_message(
                     chat_id=cid,
                     text=(
-                        "Walmart needs a quick verification check 🤖\n"
-                        "Tap *Open Browser* to solve it on your Mac, "
-                        "then tap *Done* when finished."
+                        "Walmart is blocking the bot 🤖\n\n"
+                        "Tap *Solve from Phone* for step-by-step instructions to fix it from your phone.\n\n"
+                        "Or tap *Retry* to try again in a few minutes."
                     ),
                     parse_mode="Markdown",
                     reply_markup=_challenge_keyboard(job_id),
@@ -714,12 +741,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     parse_mode="Markdown",
                 )
             elif status == "needs_user":
+                _phone_solve_jobs[cid] = job_id
                 await context.bot.send_message(
                     chat_id=cid,
                     text=(
-                        "Walmart blocked the bot again 🤖\n"
-                        "Open Walmart on your phone, make sure you're logged in, "
-                        "then tap *Retry*."
+                        "Walmart blocked the bot again 🤖\n\n"
+                        "Tap *Solve from Phone* for step-by-step instructions to fix it from your phone.\n\n"
+                        "Or tap *Retry* to try again in a few minutes."
                     ),
                     parse_mode="Markdown",
                     reply_markup=_challenge_keyboard(job_id),
@@ -738,6 +766,122 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         register_callback(job_id, on_done)
         schedule_job(job)
+
+
+# ── Cookie file upload handler ─────────────────────────────────────────────────
+
+async def cookie_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles wm_cookies.txt files sent by the user after running the phone-solve
+    JavaScript snippet on Walmart.ca.
+
+    Flow:
+      1. Bot detects a document upload whose filename is 'wm_cookies.txt'
+      2. Downloads the file content (the raw document.cookie string)
+      3. Merges the Akamai cookies into the session file
+      4. Retries the job that was awaiting phone-solve for this chat
+    """
+    chat_id = update.effective_chat.id
+    doc = update.message.document
+
+    if not doc or not (doc.file_name or "").lower().endswith("wm_cookies.txt"):
+        return  # Not our file — ignore silently
+
+    await update.message.reply_text("Got your Walmart cookies! Importing... ⏳")
+
+    try:
+        file = await doc.get_file()
+        content = bytes(await file.download_as_bytearray()).decode("utf-8", errors="ignore")
+        updated = merge_phone_cookies(content)
+    except Exception as exc:
+        logger.error("Cookie file import failed", extra={"error": str(exc)}, exc_info=True)
+        await update.message.reply_text(f"Failed to import cookies: {exc}")
+        return
+
+    if updated == 0:
+        await update.message.reply_text(
+            "No Akamai cookies found in the file.\n"
+            "Make sure you ran the code while on Walmart.ca and the page loaded normally."
+        )
+        return
+
+    # Find the job that's waiting for phone-solve
+    job_id = _phone_solve_jobs.pop(chat_id, None)
+    if not job_id:
+        await update.message.reply_text(
+            f"Imported {updated} cookie(s) ✅\n"
+            "No pending job found — use /run to start a new cart build."
+        )
+        return
+
+    job = await get_job(job_id)
+    if not job:
+        await update.message.reply_text(
+            f"Imported {updated} cookie(s) ✅\n"
+            f"Job `{job_id}` no longer exists. Use /run to start a new one.",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update_job(job_id, "pending", error=None, screenshot=None)
+
+    async def on_done(
+        cid: int,
+        url: str | None,
+        status: str,
+        error: str | None = None,
+        result: dict | None = None,
+    ) -> None:
+        res = result or {}
+        added: list[str] = res.get("added", [])
+        failed: list[str] = res.get("failed", [])
+        total = len(added) + len(failed)
+
+        if status == "done" and url:
+            summary = (
+                (
+                    f"⚠️ {len(added)}/{total} items added\n"
+                    + (("✅ " + ", ".join(added) + "\n") if added else "")
+                    + "❌ Failed: " + ", ".join(failed)
+                ) if failed else f"✅ All {total} item(s) added"
+            )
+            await context.bot.send_message(
+                chat_id=cid,
+                text=(
+                    f"Cart ready! 🎉\n{summary}\n\n"
+                    f"🛒 {url}\n\n"
+                    "_Make sure you're logged into Walmart in your browser._\n\n"
+                    f"Job: `{job_id}`"
+                ),
+                parse_mode="Markdown",
+            )
+        elif status == "needs_user":
+            _phone_solve_jobs[cid] = job_id
+            await context.bot.send_message(
+                chat_id=cid,
+                text=(
+                    "Still blocked 🤖 The cookies helped but weren't enough.\n\n"
+                    "Wait a few minutes and tap *Retry*, or try the phone-solve steps again."
+                ),
+                parse_mode="Markdown",
+                reply_markup=_challenge_keyboard(job_id),
+            )
+        else:
+            fail_note = ("\nFailed: " + ", ".join(failed)) if failed else ""
+            await context.bot.send_message(
+                chat_id=cid,
+                text=f"Cart build failed ❌\nError: {error or 'Unknown'}{fail_note}\nJob: `{job_id}`",
+                parse_mode="Markdown",
+            )
+
+    register_callback(job_id, on_done)
+    schedule_job(job)
+
+    await update.message.reply_text(
+        f"Imported {updated} Akamai cookie(s) from your phone ✅\n"
+        f"Retrying cart build for job `{job_id}`... 🛒",
+        parse_mode="Markdown",
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -782,6 +926,7 @@ def create_bot_app() -> Application:
     app.add_handler(CommandHandler("link", link_command))
     app.add_handler(CommandHandler("link_done", link_done_command))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, cookie_file_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_message))
 
     return app

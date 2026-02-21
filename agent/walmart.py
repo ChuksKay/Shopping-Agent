@@ -42,6 +42,58 @@ _TRACKING_COOKIES = {
 }
 
 
+def merge_phone_cookies(cookie_string: str, session_path: str = SESSION_PATH) -> int:
+    """
+    Parse a 'name=value; name2=value2' cookie string captured from the phone's
+    Walmart.ca session and merge the Akamai cookies into the bot's session file.
+
+    Returns the number of cookies updated/added.
+    """
+    if not Path(session_path).exists():
+        logger.warning("Session file not found; cannot merge phone cookies")
+        return 0
+
+    phone_cookies: dict[str, str] = {}
+    for part in cookie_string.split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, _, value = part.partition("=")
+            phone_cookies[name.strip()] = value.strip()
+
+    if not phone_cookies:
+        return 0
+
+    data = json.loads(Path(session_path).read_text())
+    existing = {c["name"]: i for i, c in enumerate(data.get("cookies", []))}
+    # Akamai cookies that are set by JavaScript (not HttpOnly) — readable via document.cookie
+    akamai_names = {"_abck", "ak_bmsc", "bm_sv", "bm_sz", "bm_so"}
+    updated = 0
+
+    for name in akamai_names:
+        if name not in phone_cookies:
+            continue
+        value = phone_cookies[name]
+        if name in existing:
+            idx = existing[name]
+            if data["cookies"][idx]["value"] != value:
+                data["cookies"][idx]["value"] = value
+                updated += 1
+                logger.info("Updated cookie from phone", extra={"name": name})
+        else:
+            data.setdefault("cookies", []).append({
+                "name": name, "value": value,
+                "domain": ".walmart.ca", "path": "/",
+                "expires": -1, "httpOnly": False,
+                "secure": True, "sameSite": "None",
+            })
+            updated += 1
+            logger.info("Added cookie from phone", extra={"name": name})
+
+    Path(session_path).write_text(json.dumps(data, indent=2))
+    logger.info("Phone cookie merge done", extra={"updated": updated})
+    return updated
+
+
 def _clean_session(path: str) -> dict:
     """
     Load a saved Playwright storage_state JSON and strip Akamai/PerimeterX
