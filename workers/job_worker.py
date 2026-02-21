@@ -222,22 +222,28 @@ async def _fire(
 _running: set[str] = set()
 
 
+def schedule_job(job: dict) -> None:
+    """Start a job task, guarded by _running to prevent duplicate execution."""
+    jid = job["job_id"]
+    if jid in _running:
+        return
+    _running.add(jid)
+
+    async def _run() -> None:
+        try:
+            await process_job(job)
+        finally:
+            _running.discard(jid)
+
+    asyncio.create_task(_run())
+
+
 async def worker_loop() -> None:
     logger.info("Job worker started")
     while True:
         try:
             for job in await get_pending_jobs():
-                jid = job["job_id"]
-                if jid not in _running:
-                    _running.add(jid)
-
-                    async def _run(j: dict) -> None:
-                        try:
-                            await process_job(j)
-                        finally:
-                            _running.discard(j["job_id"])
-
-                    asyncio.create_task(_run(job))
+                schedule_job(job)
         except Exception as exc:
             logger.error("worker_loop error", extra={"error": str(exc)}, exc_info=True)
 

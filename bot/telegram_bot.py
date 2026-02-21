@@ -45,7 +45,7 @@ from db.database import (
     update_job,
     upsert_chat,
 )
-from workers.job_worker import process_job, register_callback
+from workers.job_worker import process_job, register_callback, schedule_job
 
 logger = logging.getLogger(__name__)
 
@@ -338,7 +338,7 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     register_callback(job_id, on_done)
     job = await get_job(job_id)
-    asyncio.create_task(process_job(job))
+    schedule_job(job)
 
 
 # ── /screenshot ────────────────────────────────────────────────────────────────
@@ -504,7 +504,7 @@ async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
 
     register_callback(job_id, on_done)
-    asyncio.create_task(process_job(job))
+    schedule_job(job)
 
 
 # ── /link ──────────────────────────────────────────────────────────────────────
@@ -649,7 +649,7 @@ async def ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         register_callback(job_id, on_done)
         job = await get_job(job_id)
-        asyncio.create_task(process_job(job))
+        schedule_job(job)
 
     await ai_handle(chat_id, text, send, trigger_job)
 
@@ -737,7 +737,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
 
         register_callback(job_id, on_done)
-        asyncio.create_task(process_job(job))
+        schedule_job(job)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
